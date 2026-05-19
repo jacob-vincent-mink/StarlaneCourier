@@ -11,11 +11,11 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, DIFFICULTY_OPTIONS, Screen, TICK_SPEEDS},
+    app::{App, DIFFICULTY_OPTIONS, LLM_FIELDS, Screen, TICK_SPEEDS},
     game::{
-        ASTRA_PRIME, CONTRACTS_PANE, DUST_HARBOR, FLEET_PANE, GOAL_CREDITS, ION_ANCHORAGE,
-        KITE_STATION, LOG_PANE, Location, MAP_PANE, OUTER_RING_RELAY, PANE_TITLES, RefuelPlan,
-        RunOutcome, Ship, ShipState, transit_phase,
+        ASTRA_PRIME, CONTRACTS_PANE, DUST_HARBOR, Difficulty, FLEET_PANE, GOAL_CREDITS,
+        ION_ANCHORAGE, KITE_STATION, LOG_PANE, Location, MAP_PANE, OUTER_RING_RELAY, PANE_TITLES,
+        RefuelPlan, RunOutcome, Ship, ShipState, transit_phase,
     },
     save::SAVE_SLOT_COUNT,
 };
@@ -55,11 +55,23 @@ fn draw_game(frame: &mut Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(areas[2]);
+    let alert_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(bottom[0]);
 
     let map_sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(10), Constraint::Length(7)])
         .split(top[1]);
+    let board_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(top[0]);
+    let fleet_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(top[2]);
 
     let header = Paragraph::new(Line::from(vec![
         "Starlane Courier".into(),
@@ -96,7 +108,16 @@ fn draw_game(frame: &mut Frame, app: &App) {
     ));
     let mut contract_state = ListState::default();
     contract_state.select(Some(app.selected_contract));
-    frame.render_stateful_widget(contracts, top[0], &mut contract_state);
+    frame.render_stateful_widget(contracts, board_sections[0], &mut contract_state);
+
+    let contract_detail = Paragraph::new(Text::from(contract_detail_lines(app)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Contract Detail"),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(contract_detail, board_sections[1]);
 
     render_sector_map(frame, map_sections[0], app, app.active_pane == MAP_PANE);
 
@@ -118,11 +139,34 @@ fn draw_game(frame: &mut Frame, app: &App) {
     .block(pane_block(PANE_TITLES[2], app.active_pane == FLEET_PANE));
     let mut fleet_state = ListState::default();
     fleet_state.select(Some(app.selected_ship));
-    frame.render_stateful_widget(fleet, top[2], &mut fleet_state);
+    frame.render_stateful_widget(fleet, fleet_sections[0], &mut fleet_state);
+
+    let ship_detail = Paragraph::new(Text::from(ship_detail_lines(app)))
+        .block(Block::default().borders(Borders::ALL).title("Ship Detail"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(ship_detail, fleet_sections[1]);
+
+    let alerts_data = app.current_alerts();
+    let alerts = List::new(alerts_data.iter().map(|alert| {
+        let prefix = match alert.severity {
+            crate::game::AlertSeverity::Info => "Info: ",
+            crate::game::AlertSeverity::Warning => "Warn: ",
+            crate::game::AlertSeverity::Critical => "Critical: ",
+        };
+        ListItem::new(format!("{}{}", prefix, alert.summary))
+    }))
+    .highlight_style(selection_style())
+    .highlight_symbol(">> ")
+    .block(pane_block("Alerts", app.active_pane == LOG_PANE));
+    let mut alerts_state = ListState::default();
+    alerts_state.select(Some(
+        app.selected_alert.min(alerts_data.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(alerts, alert_sections[0], &mut alerts_state);
 
     let log = List::new(app.log.iter().map(|entry| ListItem::new(entry.as_str())))
         .block(pane_block(PANE_TITLES[3], app.active_pane == LOG_PANE));
-    frame.render_widget(log, bottom[0]);
+    frame.render_widget(log, alert_sections[1]);
 
     let mission = Paragraph::new(Text::from(build_mission_text(app)))
         .block(Block::default().borders(Borders::ALL).title("Mission"))
@@ -195,6 +239,7 @@ fn draw_start_menu(frame: &mut Frame, app: &App) {
             "Current settings: {} speed ({} ms/tick)",
             TICK_SPEEDS[app.tick_speed_index].0, TICK_SPEEDS[app.tick_speed_index].1,
         )),
+        Line::from(app.llm_summary()),
         Line::from("Contracts reward credits; frontier arrivals reveal deeper routes."),
         Line::from(""),
         Line::from(
@@ -282,9 +327,10 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(32),
-            Constraint::Percentage(36),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(28),
+            Constraint::Percentage(28),
         ])
         .split(areas[1]);
 
@@ -329,6 +375,42 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     difficulty_state.select(Some(app.difficulty_selection));
     frame.render_stateful_widget(difficulty_list, body[1], &mut difficulty_state);
 
+    let llm_list = List::new(LLM_FIELDS.iter().map(|field| {
+        let value = if app
+            .settings_edit
+            .as_ref()
+            .is_some_and(|edit| edit.field == *field)
+        {
+            let edit = app.settings_edit.as_ref().unwrap();
+            if edit.secret {
+                format!(
+                    "{}: {}",
+                    app.llm_field_label(*field),
+                    "*".repeat(edit.buffer.len().max(1))
+                )
+            } else {
+                format!("{}: {}", app.llm_field_label(*field), edit.buffer)
+            }
+        } else {
+            format!(
+                "{}: {}",
+                app.llm_field_label(*field),
+                app.llm_field_value(*field)
+            )
+        };
+        ListItem::new(value)
+    }))
+    .highlight_style(selection_style())
+    .highlight_symbol(">> ")
+    .block(pane_block("LLM", app.settings_focus == 2));
+    let mut llm_state = ListState::default();
+    llm_state.select(Some(
+        app.llm_field_selection
+            .min(LLM_FIELDS.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(llm_list, body[2], &mut llm_state);
+
+    let selected_field = app.selected_llm_field();
     let detail = Paragraph::new(Text::from(vec![
         Line::from("Simulation speed controls how fast route ETAs and ambient events advance."),
         Line::from(
@@ -342,13 +424,26 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         )),
         Line::from(""),
         Line::from(DIFFICULTY_OPTIONS[app.difficulty_selection].description()),
+        Line::from(""),
+        Line::from(format!(
+            "LLM field: {}",
+            app.llm_field_label(selected_field)
+        )),
+        Line::from(app.llm_field_description(selected_field)),
+        Line::from(""),
+        Line::from(app.llm_summary()),
+        Line::from(if app.settings_edit.is_some() {
+            "Editing: type text, Backspace, Enter to save, Esc to cancel".to_string()
+        } else {
+            "Settings: Enter edits/toggles the selected field; Delete clears API key".to_string()
+        }),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Effect"))
     .wrap(Wrap { trim: true });
-    frame.render_widget(detail, body[2]);
+    frame.render_widget(detail, body[3]);
 
     let footer = Paragraph::new(Line::from(
-        "Left/Right: focus   Up/Down: choose   Enter: apply   Esc: back   q/Ctrl+C: quit",
+        "Left/Right: focus   Up/Down: choose   Enter: apply/edit   Delete: clear API key   Esc: back   q/Ctrl+C: quit",
     ))
     .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, areas[2]);
@@ -378,10 +473,12 @@ fn draw_how_to_play(frame: &mut Frame, app: &App) {
         )),
         Line::from("1. Accept a contract from the Mission Board."),
         Line::from("2. Refuel with `f` or transfer dockside fuel with `t` if needed."),
-        Line::from("3. Move to Fleet and press Enter on a docked ship."),
-        Line::from("4. Focus the map, pick the contract destination, and confirm the route."),
-        Line::from("5. Watch the ship move through undocking, cruising, approach, and arrival."),
-        Line::from("6. Frontier arrivals reveal new charts and unlock deeper contracts."),
+        Line::from("3. Upgrade a docked ship with `u` if you need more speed or range."),
+        Line::from("4. Move to Fleet and press Enter on a docked ship."),
+        Line::from("5. Focus the map, pick the contract destination, and confirm the route."),
+        Line::from("6. Watch the ship move through undocking, cruising, incidents, and arrival."),
+        Line::from("7. Use Alerts with Enter to jump to urgent ships, stations, or contracts."),
+        Line::from("8. Frontier arrivals reveal new charts and unlock deeper contracts."),
         Line::from(""),
         Line::from("Difficulties:"),
         Line::from("Cozy: fixed rewards, no timeout pressure, no fuel economy."),
@@ -567,7 +664,7 @@ fn render_sector_map(frame: &mut Frame, area: Rect, app: &App, active: bool) {
             let mut dock_slots = vec![0usize; app.locations.len()];
             for (ship_index, ship) in app.fleet.iter().enumerate() {
                 match &ship.state {
-                    ShipState::Docked => {
+                    ShipState::Docked | ShipState::Repairing { .. } => {
                         if !app.is_discovered(ship.current_location) {
                             continue;
                         }
@@ -644,8 +741,7 @@ fn contract_list_item(app: &App, index: usize) -> ListItem<'static> {
             app.contract_current_reward(index),
             contract.max_eta,
         )),
-        Line::from(app.contract_pressure_text(index)),
-        Line::from(app.contract_hint(index)),
+        Line::from(contract_list_summary(app, index)),
     ])
 }
 
@@ -777,7 +873,9 @@ fn station_fuel_style(app: &App, index: usize) -> Style {
 }
 
 fn ship_color(app: &App, ship_index: usize) -> Color {
-    if app.pending_ship() == Some(ship_index) {
+    if matches!(app.fleet[ship_index].state, ShipState::Repairing { .. }) {
+        Color::Red
+    } else if app.pending_ship() == Some(ship_index) {
         Color::Green
     } else if app.selected_ship == ship_index {
         Color::Yellow
@@ -1024,6 +1122,23 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
 
             lines.push(Line::from("Press Enter in Fleet to dispatch this ship."));
         }
+        ShipState::Repairing { ticks_remaining } => {
+            lines.push(Line::from(format!(
+                "Repairing at {}",
+                app.location_name(ship.current_location)
+            )));
+            lines.push(Line::from(format!(
+                "Ship stats: speed {} | fuel {}/{}",
+                ship.speed, ship.current_fuel, ship.max_fuel
+            )));
+            lines.push(Line::from(format!(
+                "Repairs remaining: {} ticks",
+                ticks_remaining
+            )));
+            lines.push(Line::from(
+                "This ship cannot launch until repairs complete.",
+            ));
+        }
         ShipState::EnRoute {
             origin,
             destination,
@@ -1128,6 +1243,188 @@ fn route_fuel_lines(app: &App, ship_index: usize, fuel_required: u16) -> Vec<Lin
     lines
 }
 
+fn contract_list_summary(app: &App, index: usize) -> String {
+    let contract = &app.contracts[index];
+
+    match contract.state {
+        crate::game::ContractState::Available => match app.difficulty {
+            Difficulty::Cozy => "Open | no expiry".to_string(),
+            Difficulty::Normal => "Open | reward decays after accept".to_string(),
+            Difficulty::Insane => format!("Open | {}t window after accept", contract.deadline),
+        },
+        crate::game::ContractState::Accepted { .. } => app.contract_pressure_text(index),
+        crate::game::ContractState::Assigned { ship_name, .. } => {
+            format!("Assigned to {}", ship_name)
+        }
+        crate::game::ContractState::Completed => "Completed; slot will refresh".to_string(),
+        crate::game::ContractState::Failed => "Failed; slot will refresh".to_string(),
+    }
+}
+
+fn contract_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let index = app.selected_contract;
+    let contract = &app.contracts[index];
+
+    if !app.is_contract_unlocked(index) {
+        return vec![
+            Line::from("Locked Opportunity"),
+            Line::from(format!(
+                "Unlock by charting {}.",
+                app.location_name(contract.unlock_location)
+            )),
+            Line::from(contract.briefing.clone()),
+        ];
+    }
+
+    let mut lines = vec![
+        Line::from(format!(
+            "{} [{}]",
+            contract.title,
+            app.contract_status_label(index)
+        )),
+        Line::from(format!(
+            "Route: {} -> {}",
+            app.location_name(contract.origin),
+            app.location_name(contract.destination)
+        )),
+        Line::from(format!(
+            "Reward now: {} cr | Target ETA <= {}",
+            app.contract_current_reward(index),
+            contract.max_eta
+        )),
+        Line::from(format!("Archetype: {}", contract.archetype.title())),
+        Line::from(contract.archetype.effect_summary()),
+        Line::from(app.contract_pressure_text(index)),
+        Line::from(contract.briefing.clone()),
+    ];
+
+    if matches!(app.difficulty, Difficulty::Cozy) {
+        if let Some((ship_index, eta)) = best_ship_hint(app, index) {
+            lines.push(Line::from(format!(
+                "Cozy hint: best docked fit is {} (ETA {}).",
+                app.fleet[ship_index].name, eta
+            )));
+        } else {
+            lines.push(Line::from(
+                "Cozy hint: no docked ship can complete this contract right now.",
+            ));
+        }
+    }
+
+    if app.tracked_contract == Some(index) {
+        lines.push(Line::from(
+            "Tracked contract: this is the current assignment target.",
+        ));
+    }
+
+    lines.push(Line::from(
+        "Enter on Mission Board: accept or release this contract.",
+    ));
+    lines
+}
+
+fn ship_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let ship_index = app.selected_ship;
+    let ship = &app.fleet[ship_index];
+    let station = app.location_name(ship.current_location);
+    let mut lines = vec![
+        Line::from(ship.name),
+        Line::from(format!("Station: {}", station)),
+        Line::from(format!(
+            "Speed: {} | Fuel: {}/{}",
+            ship.speed, ship.current_fuel, ship.max_fuel
+        )),
+        Line::from(format!(
+            "Hull: {}% | Condition: {}",
+            ship.hull,
+            crate::game::GameData::hull_status(ship)
+        )),
+        Line::from(format!(
+            "Station fuel stock: {}",
+            app.station_fuel[ship.current_location]
+        )),
+    ];
+
+    if ship.current_fuel <= ship.max_fuel.saturating_div(4).max(1) {
+        lines.push(Line::from(
+            "Low fuel: refuel with `f` or transfer with `t`.",
+        ));
+    }
+
+    match &ship.state {
+        ShipState::Docked => {
+            lines.push(Line::from("Status: docked and available."));
+            if let Some(contract_index) = app.tracked_contract {
+                let contract = &app.contracts[contract_index];
+                if contract.origin != ship.current_location {
+                    lines.push(Line::from(format!(
+                        "Tracked contract starts elsewhere: {}.",
+                        app.location_name(contract.origin)
+                    )));
+                } else if let Some(plan) = app.plan_route_for_ship(ship_index, contract.destination)
+                {
+                    if plan.eta > contract.max_eta {
+                        lines.push(Line::from(format!(
+                            "Too slow for tracked contract: ETA {} > {}.",
+                            plan.eta, contract.max_eta
+                        )));
+                    } else if ship.current_fuel < plan.fuel_required {
+                        lines.push(Line::from(format!(
+                            "Needs {} fuel before it can run the tracked contract.",
+                            plan.fuel_required - ship.current_fuel
+                        )));
+                    } else {
+                        lines.push(Line::from("Ready for tracked contract with current fuel."));
+                    }
+                }
+            }
+            lines.push(Line::from(
+                "Actions: `f` buy station fuel, `t` transfer dockside fuel.",
+            ));
+            if let Some(offer) = app.next_upgrade_offer(ship_index) {
+                lines.push(Line::from(format!(
+                    "Upgrade with `u`: {}",
+                    offer.description
+                )));
+            } else {
+                lines.push(Line::from(
+                    "Upgrade with `u`: no dockside upgrade currently offered.",
+                ));
+            }
+        }
+        ShipState::Repairing { ticks_remaining } => {
+            lines.push(Line::from(format!(
+                "Status: repairing in port ({} ticks remaining).",
+                ticks_remaining
+            )));
+            lines.push(Line::from("Actions locked until repairs complete."));
+        }
+        ShipState::EnRoute {
+            destination,
+            eta_remaining,
+            total_eta,
+            assigned_contract,
+            ..
+        } => {
+            lines.push(Line::from(format!(
+                "Status: en route to {} ({}/{})",
+                app.location_name(*destination),
+                eta_remaining,
+                total_eta
+            )));
+            if let Some(contract_index) = assigned_contract {
+                lines.push(Line::from(format!(
+                    "Carrying: {}",
+                    app.contracts[*contract_index].title
+                )));
+            }
+            lines.push(Line::from("Fuel actions unavailable while in transit."));
+        }
+    }
+
+    lines
+}
+
 fn ship_list_item(
     ship: &Ship,
     locations: &[Location],
@@ -1143,15 +1440,23 @@ fn ship_list_item(
         ShipState::Docked => (
             format!("Docked at {}", locations[ship.current_location].name),
             format!(
-                "Fuel {}/{} | Speed {} | Ready for assignment{}",
+                "Fuel {}/{} | Speed {} | Hull {}%{}",
                 ship.current_fuel,
                 ship.max_fuel,
                 ship.speed,
+                ship.hull,
                 if ship.current_fuel * 4 <= ship.max_fuel {
                     " | LOW FUEL"
                 } else {
                     ""
                 }
+            ),
+        ),
+        ShipState::Repairing { ticks_remaining } => (
+            format!("Repairing at {}", locations[ship.current_location].name),
+            format!(
+                "Fuel {}/{} | Speed {} | Hull {}% | {} ticks remaining",
+                ship.current_fuel, ship.max_fuel, ship.speed, ship.hull, ticks_remaining
             ),
         ),
         ShipState::EnRoute {
@@ -1160,33 +1465,42 @@ fn ship_list_item(
             eta_remaining,
             total_eta,
             assigned_contract,
-            condition_summary,
             ..
         } => {
             let phase = transit_phase(*eta_remaining, *total_eta);
             let detail = if let Some(contract_index) = assigned_contract {
                 format!(
-                    "{} | carrying {} | fuel reserve {}/{} | speed {}",
-                    condition_summary,
+                    "carrying {} | fuel {}/{} | speed {} | hull {}%",
                     contracts[*contract_index].title,
                     ship.current_fuel,
                     ship.max_fuel,
-                    ship.speed
+                    ship.speed,
+                    ship.hull
                 )
             } else {
                 format!(
-                    "{} | fuel reserve {}/{} | speed {}",
-                    condition_summary, ship.current_fuel, ship.max_fuel, ship.speed
+                    "fuel {}/{} | speed {} | hull {}% | underway",
+                    ship.current_fuel, ship.max_fuel, ship.speed, ship.hull
                 )
             };
-            (
-                phase.status_line(
+            let status = if let Some(contract_index) = assigned_contract {
+                format!(
+                    "{} -> {} | {} | {}",
                     locations[*origin].name,
                     locations[*destination].name,
-                    *eta_remaining,
-                ),
-                detail,
-            )
+                    phase.label(),
+                    contracts[*contract_index].title
+                )
+            } else {
+                format!(
+                    "{} -> {} | {} | ETA {}",
+                    locations[*origin].name,
+                    locations[*destination].name,
+                    phase.label(),
+                    eta_remaining
+                )
+            };
+            (status, detail)
         }
     };
 
@@ -1195,4 +1509,23 @@ fn ship_list_item(
         Line::from(status),
         Line::from(detail),
     ])
+}
+
+fn best_ship_hint(app: &App, contract_index: usize) -> Option<(usize, u16)> {
+    let contract = &app.contracts[contract_index];
+
+    app.fleet
+        .iter()
+        .enumerate()
+        .filter(|(_, ship)| {
+            matches!(ship.state, ShipState::Docked) && ship.current_location == contract.origin
+        })
+        .filter_map(|(ship_index, ship)| {
+            app.plan_route_for_ship(ship_index, contract.destination)
+                .and_then(|plan| {
+                    (plan.eta <= contract.max_eta && ship.current_fuel >= plan.fuel_required)
+                        .then_some((ship_index, plan.eta))
+                })
+        })
+        .min_by_key(|(_, eta)| *eta)
 }

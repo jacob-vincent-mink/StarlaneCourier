@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::{Difficulty, RunOutcome, default_difficulty};
+use crate::game::{ContractArchetype, Difficulty, RunOutcome, default_difficulty};
 
 pub(crate) const SAVE_DIR: &str = "saves";
 pub(crate) const SAVE_SLOT_COUNT: usize = 3;
@@ -52,12 +52,17 @@ pub(crate) struct SavedShip {
     pub(crate) current_fuel: u16,
     #[serde(default)]
     pub(crate) max_fuel: u16,
+    #[serde(default = "default_hull")]
+    pub(crate) hull: u16,
     pub(crate) state: SavedShipState,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum SavedShipState {
     Docked,
+    Repairing {
+        ticks_remaining: u16,
+    },
     EnRoute {
         origin: usize,
         destination: usize,
@@ -66,12 +71,32 @@ pub(crate) enum SavedShipState {
         route: String,
         condition_summary: String,
         assigned_contract: Option<usize>,
+        #[serde(default)]
+        repair_on_arrival: u16,
     },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SavedContract {
+    #[serde(default = "default_contract_archetype")]
+    pub(crate) archetype: ContractArchetype,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) briefing: String,
+    #[serde(default = "default_contract_origin")]
+    pub(crate) origin: usize,
+    #[serde(default = "default_contract_destination")]
+    pub(crate) destination: usize,
+    #[serde(default)]
+    pub(crate) reward: i32,
+    #[serde(default = "default_contract_eta")]
+    pub(crate) max_eta: u16,
     pub(crate) deadline: u64,
+    #[serde(default = "default_contract_destination")]
+    pub(crate) unlock_location: usize,
+    #[serde(default = "default_pending_llm_flavor")]
+    pub(crate) pending_llm_flavor: bool,
     pub(crate) state: SavedContractState,
 }
 
@@ -90,6 +115,30 @@ pub(crate) trait SaveStore {
 }
 
 pub(crate) struct FsSaveStore;
+
+fn default_contract_archetype() -> ContractArchetype {
+    ContractArchetype::SurveyDrop
+}
+
+fn default_contract_origin() -> usize {
+    0
+}
+
+fn default_contract_destination() -> usize {
+    3
+}
+
+fn default_contract_eta() -> u16 {
+    4
+}
+
+fn default_pending_llm_flavor() -> bool {
+    true
+}
+
+fn default_hull() -> u16 {
+    100
+}
 
 impl SaveStore for FsSaveStore {
     fn read_slot(&self, slot_index: usize) -> Result<Option<SaveGame>, String> {

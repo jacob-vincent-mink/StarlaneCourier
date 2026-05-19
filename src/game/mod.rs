@@ -2,9 +2,8 @@ mod contracts;
 mod fuel;
 mod outcome;
 mod routing;
+mod ships;
 mod types;
-
-use self::types::ShipEvent;
 
 pub(crate) use self::types::*;
 
@@ -29,6 +28,7 @@ pub(crate) struct GameData {
     pub(crate) active_pane: usize,
     pub(crate) clock: u64,
     pub(crate) mode: AppMode,
+    pub(crate) selected_alert: usize,
     pub(crate) selected_location: usize,
     pub(crate) selected_ship: usize,
     pub(crate) selected_contract: usize,
@@ -50,6 +50,7 @@ impl GameData {
             active_pane: CONTRACTS_PANE,
             clock: 0,
             mode: AppMode::Browse,
+            selected_alert: 0,
             selected_location: DUST_HARBOR,
             selected_ship: 0,
             selected_contract: 0,
@@ -78,13 +79,13 @@ impl GameData {
                     2,
                     16,
                     1,
+                    0,
                 ),
                 Ship::docked("HMV Orpheus", ASTRA_PRIME, 13, 18, 3),
             ],
             contracts: vec![
                 Contract::new(
-                    "Frontier Survey Drop",
-                    "Carry survey drones to Dust Harbor and expand the frontier.",
+                    ContractArchetype::SurveyDrop,
                     ASTRA_PRIME,
                     DUST_HARBOR,
                     160,
@@ -93,8 +94,7 @@ impl GameData {
                     DUST_HARBOR,
                 ),
                 Contract::new(
-                    "Harbor Relief Return",
-                    "Bring relief crates back from Dust Harbor before local stores spoil.",
+                    ContractArchetype::ReliefReturn,
                     DUST_HARBOR,
                     ASTRA_PRIME,
                     140,
@@ -103,8 +103,7 @@ impl GameData {
                     DUST_HARBOR,
                 ),
                 Contract::new(
-                    "Medlift to Dust",
-                    "Rush medical pallets to Dust Harbor on the same shift.",
+                    ContractArchetype::Medlift,
                     ASTRA_PRIME,
                     DUST_HARBOR,
                     190,
@@ -113,8 +112,7 @@ impl GameData {
                     DUST_HARBOR,
                 ),
                 Contract::new(
-                    "Kite Courier Run",
-                    "Open commercial traffic with Kite Station once the chart is confirmed.",
+                    ContractArchetype::CourierRun,
                     ASTRA_PRIME,
                     KITE_STATION,
                     230,
@@ -123,8 +121,7 @@ impl GameData {
                     KITE_STATION,
                 ),
                 Contract::new(
-                    "Ion Drydock Refit",
-                    "Deliver replacement coils to Ion Anchorage for a high-value refit.",
+                    ContractArchetype::DrydockRefit,
                     ASTRA_PRIME,
                     ION_ANCHORAGE,
                     300,
@@ -133,8 +130,7 @@ impl GameData {
                     ION_ANCHORAGE,
                 ),
                 Contract::new(
-                    "Relay Calibration Window",
-                    "Reach Outer Ring Relay and stabilize the signal array before the window closes.",
+                    ContractArchetype::RelayCalibration,
                     ION_ANCHORAGE,
                     OUTER_RING_RELAY,
                     420,
@@ -176,6 +172,10 @@ impl GameData {
             FLEET_PANE => {
                 self.selected_ship = wrap_index(self.selected_ship, self.fleet.len(), delta);
             }
+            LOG_PANE => {
+                let alert_count = self.current_alerts().len().max(1);
+                self.selected_alert = wrap_index(self.selected_alert, alert_count, delta);
+            }
             _ => {}
         }
     }
@@ -185,6 +185,7 @@ impl GameData {
             AppMode::Browse => match self.active_pane {
                 CONTRACTS_PANE => self.toggle_contract_tracking(),
                 FLEET_PANE => self.begin_dispatch(),
+                LOG_PANE => self.focus_selected_alert(),
                 _ => {}
             },
             AppMode::SelectingDestination { .. } => {
@@ -198,75 +199,136 @@ impl GameData {
     pub(crate) fn tick(&mut self) {
         self.clock += 1;
         let mut arrivals = Vec::new();
-        let mut events = Vec::new();
+        let mut travel_logs = Vec::new();
+        let location_names: Vec<&'static str> = self
+            .locations
+            .iter()
+            .map(|location| location.name)
+            .collect();
 
         for (ship_index, ship) in self.fleet.iter_mut().enumerate() {
+            if let ShipState::Repairing { ticks_remaining } = &mut ship.state {
+                if *ticks_remaining > 0 {
+                    *ticks_remaining -= 1;
+                }
+                if *ticks_remaining == 0 {
+                    ship.hull = 100;
+                    ship.state = ShipState::Docked;
+                    let message = format!(
+                        "[{clock:04}] {name} completed port repairs and is flight-ready again.",
+                        clock = self.clock,
+                        name = ship.name,
+                    );
+                    travel_logs.push(message.clone());
+                }
+                continue;
+            }
+
             if let ShipState::EnRoute {
                 destination,
                 eta_remaining,
                 total_eta,
                 assigned_contract,
+                repair_on_arrival,
                 ..
             } = &mut ship.state
             {
                 let destination_index = *destination;
                 let contract_assignment = *assigned_contract;
+                let mut event_happened = false;
 
-                if *eta_remaining == *total_eta {
-                    events.push(ShipEvent::Departed {
-                        name: ship.name,
-                        origin: ship.current_location,
-                        destination: destination_index,
-                    });
+                if let Some(travel_event) = travel_event_at(
+                    self.clock,
+                    ship_index,
+                    destination_index,
+                    *eta_remaining,
+                    self.difficulty,
+                ) {
+                    event_happened = true;
+                    match travel_event {
+                        TravelEvent::Tailwind => {
+                            if *eta_remaining > 1 {
+                                *eta_remaining = eta_remaining.saturating_sub(1);
+                                *total_eta = total_eta.saturating_sub(1).max(*eta_remaining);
+                                let message = format!(
+                                    "[{clock:04}] Tailwind burst: {name} gains a lane on the run to {destination}.",
+                                    clock = self.clock,
+                                    name = ship.name,
+                                    destination = location_names[destination_index],
+                                );
+                                travel_logs.push(message);
+                            }
+                        }
+                        TravelEvent::Delay => {
+                            *eta_remaining = eta_remaining.saturating_add(1);
+                            *total_eta = total_eta.saturating_add(1);
+                            let message = format!(
+                                "[{clock:04}] Lane congestion: {name} loses time on the way to {destination}.",
+                                clock = self.clock,
+                                name = ship.name,
+                                destination = location_names[destination_index],
+                            );
+                            travel_logs.push(message);
+                        }
+                        TravelEvent::Damage => {
+                            *eta_remaining = eta_remaining.saturating_add(2);
+                            *total_eta = total_eta.saturating_add(2);
+                            *repair_on_arrival = repair_on_arrival.saturating_add(2);
+                            ship.hull = ship.hull.saturating_sub(25).max(10);
+                            let message = format!(
+                                "[{clock:04}] Micrometeor strike: {name} is damaged and will need repairs after reaching {destination}.",
+                                clock = self.clock,
+                                name = ship.name,
+                                destination = location_names[destination_index],
+                            );
+                            travel_logs.push(message.clone());
+                        }
+                    }
                 }
 
                 if *eta_remaining > 0 {
                     *eta_remaining -= 1;
                 }
 
-                if *eta_remaining == 1 {
-                    events.push(ShipEvent::Approaching {
-                        name: ship.name,
-                        destination: destination_index,
-                    });
-                }
-
                 if *eta_remaining == 0 {
                     ship.current_location = destination_index;
-                    ship.state = ShipState::Docked;
+                    let repair_ticks = *repair_on_arrival;
+                    ship.state = if repair_ticks > 0 {
+                        ShipState::Repairing {
+                            ticks_remaining: repair_ticks,
+                        }
+                    } else {
+                        ShipState::Docked
+                    };
                     arrivals.push((
                         ship_index,
                         ship.name,
                         destination_index,
                         contract_assignment,
+                        repair_ticks,
+                    ));
+                } else if !event_happened
+                    && self.clock % 48 == 0
+                    && *eta_remaining == *total_eta / 2
+                {
+                    travel_logs.push(format!(
+                        "[{clock:04}] {name} reports steady travel toward {destination}.",
+                        clock = self.clock,
+                        name = ship.name,
+                        destination = location_names[destination_index],
                     ));
                 }
             }
         }
 
-        for event in events {
-            match event {
-                ShipEvent::Departed {
-                    name,
-                    origin,
-                    destination,
-                } => self.push_log(format!(
-                    "[{clock:04}] {name} cleared {origin} and is outbound for {destination}.",
-                    clock = self.clock,
-                    name = name,
-                    origin = self.location_name(origin),
-                    destination = self.location_name(destination),
-                )),
-                ShipEvent::Approaching { name, destination } => self.push_log(format!(
-                    "[{clock:04}] {name} is on final approach to {destination}.",
-                    clock = self.clock,
-                    name = name,
-                    destination = self.location_name(destination),
-                )),
-            }
+        for entry in travel_logs {
+            self.push_log(entry);
         }
 
-        for (ship_index, ship_name, destination_index, contract_assignment) in arrivals {
+        let had_arrivals = !arrivals.is_empty();
+        for (ship_index, ship_name, destination_index, contract_assignment, repair_ticks) in
+            arrivals
+        {
             self.push_log(format!(
                 "[{clock:04}] {name} arrived at {destination}.",
                 clock = self.clock,
@@ -274,10 +336,24 @@ impl GameData {
                 destination = self.location_name(destination_index),
             ));
 
+            if repair_ticks > 0 {
+                self.push_log(format!(
+                    "[{clock:04}] {name} enters port repairs for {} ticks.",
+                    repair_ticks,
+                    clock = self.clock,
+                    name = ship_name,
+                ));
+            }
+
             self.sync_low_fuel_alert(ship_index);
 
             if let Some(contract_index) = contract_assignment {
-                self.resolve_contract_arrival(contract_index, ship_name, destination_index);
+                self.resolve_contract_arrival(
+                    contract_index,
+                    ship_index,
+                    ship_name,
+                    destination_index,
+                );
             }
 
             if let Some(discovery) = self.reveal_from_arrival(destination_index) {
@@ -286,8 +362,9 @@ impl GameData {
         }
 
         self.update_contract_deadlines();
+        self.restock_station_fuel();
 
-        if self.clock % 16 == 0 {
+        if self.clock % 32 == 0 && !had_arrivals {
             self.push_log(self.ambient_event());
         }
 
@@ -302,9 +379,145 @@ impl GameData {
             .collect()
     }
 
+    pub(crate) fn current_alerts(&self) -> Vec<Incident> {
+        let mut alerts = Vec::new();
+
+        for (ship_index, ship) in self.fleet.iter().enumerate() {
+            match ship.state {
+                ShipState::Repairing { ticks_remaining } => alerts.push(Incident {
+                    summary: format!(
+                        "{} repairing: {} ticks remaining",
+                        ship.name, ticks_remaining
+                    ),
+                    severity: AlertSeverity::Warning,
+                    target: AlertTarget::Ship(ship_index),
+                }),
+                ShipState::EnRoute {
+                    repair_on_arrival, ..
+                } if repair_on_arrival > 0 => alerts.push(Incident {
+                    summary: format!(
+                        "{} damaged in transit; repairs queued on arrival",
+                        ship.name
+                    ),
+                    severity: AlertSeverity::Warning,
+                    target: AlertTarget::Ship(ship_index),
+                }),
+                _ => {}
+            }
+
+            if ship.current_fuel <= Self::fuel_alert_threshold(ship) {
+                alerts.push(Incident {
+                    summary: format!(
+                        "{} low fuel: {}/{}",
+                        ship.name, ship.current_fuel, ship.max_fuel
+                    ),
+                    severity: if ship.current_fuel == 0 {
+                        AlertSeverity::Critical
+                    } else {
+                        AlertSeverity::Warning
+                    },
+                    target: AlertTarget::Ship(ship_index),
+                });
+            }
+        }
+
+        if let Some(contract_index) = self.tracked_contract {
+            alerts.push(Incident {
+                summary: format!("Tracked contract: {}", self.contracts[contract_index].title),
+                severity: AlertSeverity::Info,
+                target: AlertTarget::Contract(contract_index),
+            });
+        }
+
+        for (location_index, fuel) in self.station_fuel.iter().enumerate() {
+            if self.is_discovered(location_index) && *fuel <= 4 {
+                alerts.push(Incident {
+                    summary: format!(
+                        "{} low fuel stock: {} units",
+                        self.location_name(location_index),
+                        fuel
+                    ),
+                    severity: AlertSeverity::Warning,
+                    target: AlertTarget::Location(location_index),
+                });
+            }
+        }
+
+        if self.difficulty.uses_fuel_economy() && self.credits <= 20 {
+            alerts.push(Incident {
+                summary: format!(
+                    "Low credits: {} cr available for fuel and repairs",
+                    self.credits
+                ),
+                severity: AlertSeverity::Warning,
+                target: AlertTarget::None,
+            });
+        }
+
+        if let Some(outcome) = &self.run_outcome {
+            alerts.push(Incident {
+                summary: outcome.message().to_string(),
+                severity: if matches!(outcome, RunOutcome::Won) {
+                    AlertSeverity::Info
+                } else {
+                    AlertSeverity::Critical
+                },
+                target: AlertTarget::None,
+            });
+        }
+
+        if alerts.is_empty() {
+            alerts.push(Incident {
+                summary: "No urgent incidents. Keep the lanes moving.".to_string(),
+                severity: AlertSeverity::Info,
+                target: AlertTarget::None,
+            });
+        }
+
+        alerts
+    }
+
+    pub(crate) fn focus_selected_alert(&mut self) {
+        let alerts = self.current_alerts();
+        if alerts.is_empty() {
+            return;
+        }
+
+        match alerts[self.selected_alert.min(alerts.len() - 1)].target {
+            AlertTarget::Contract(contract_index) => {
+                self.active_pane = CONTRACTS_PANE;
+                self.selected_contract = contract_index.min(self.contracts.len() - 1);
+            }
+            AlertTarget::Ship(ship_index) => {
+                self.active_pane = FLEET_PANE;
+                self.selected_ship = ship_index.min(self.fleet.len() - 1);
+            }
+            AlertTarget::Location(location_index) => {
+                self.active_pane = MAP_PANE;
+                self.selected_location = location_index.min(self.locations.len() - 1);
+            }
+            AlertTarget::None => {}
+        }
+    }
+
     pub(crate) fn push_log(&mut self, entry: String) {
         self.log.insert(0, entry);
         self.log.truncate(8);
+    }
+
+    fn restock_station_fuel(&mut self) {
+        if self.clock == 0 || !self.clock.is_multiple_of(20) {
+            return;
+        }
+
+        for index in 0..self.station_fuel.len() {
+            let delta = 3 + ((self.clock / 20 + index as u64) % 4) as u16;
+            self.station_fuel[index] = self.station_fuel[index].saturating_add(delta).min(60);
+        }
+        self.push_log(format!(
+            "[{clock:04}] Fuel convoys topped up station reserves across the lanes.",
+            clock = self.clock,
+        ));
     }
 }
 
@@ -318,4 +531,48 @@ pub(crate) fn ceil_div_u16(value: u16, divisor: u16) -> u16 {
     }
 
     value.div_ceil(divisor)
+}
+
+enum TravelEvent {
+    Tailwind,
+    Delay,
+    Damage,
+}
+
+fn travel_event_at(
+    clock: u64,
+    ship_index: usize,
+    destination_index: usize,
+    eta_remaining: u16,
+    difficulty: Difficulty,
+) -> Option<TravelEvent> {
+    if eta_remaining <= 1 {
+        return None;
+    }
+
+    let seed = clock
+        .wrapping_mul(31)
+        .wrapping_add((ship_index as u64 + 1) * 17)
+        .wrapping_add((destination_index as u64 + 1) * 13)
+        .wrapping_add(u64::from(eta_remaining));
+
+    match difficulty {
+        Difficulty::Cozy => match seed % 19 {
+            0 => Some(TravelEvent::Tailwind),
+            1 => Some(TravelEvent::Delay),
+            _ => None,
+        },
+        Difficulty::Normal => match seed % 17 {
+            0 => Some(TravelEvent::Tailwind),
+            1 | 2 => Some(TravelEvent::Delay),
+            3 => Some(TravelEvent::Damage),
+            _ => None,
+        },
+        Difficulty::Insane => match seed % 13 {
+            0 => Some(TravelEvent::Tailwind),
+            1 | 2 | 3 => Some(TravelEvent::Delay),
+            4 | 5 => Some(TravelEvent::Damage),
+            _ => None,
+        },
+    }
 }

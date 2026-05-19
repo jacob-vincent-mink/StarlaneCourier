@@ -138,6 +138,7 @@ impl GameData {
             route: plan.path.clone(),
             condition_summary: plan.condition_summary.clone(),
             assigned_contract,
+            repair_on_arrival: 0,
         };
         self.mode = AppMode::Browse;
         self.active_pane = FLEET_PANE;

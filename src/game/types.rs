@@ -99,6 +99,27 @@ impl RunOutcome {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlertTarget {
+    Contract(usize),
+    Ship(usize),
+    Location(usize),
+    None,
+}
+
+pub(crate) struct Incident {
+    pub(crate) summary: String,
+    pub(crate) severity: AlertSeverity,
+    pub(crate) target: AlertTarget,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum AppMode {
     Browse,
@@ -119,22 +140,102 @@ pub(crate) enum ContractState {
     Failed,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum ContractArchetype {
+    SurveyDrop,
+    ReliefReturn,
+    Medlift,
+    CourierRun,
+    DrydockRefit,
+    RelayCalibration,
+    OutboundCourier,
+    ReturnFreight,
+    PriorityRelay,
+    FrontierSupply,
+}
+
+impl ContractArchetype {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::SurveyDrop => "Frontier Survey Drop",
+            Self::ReliefReturn => "Harbor Relief Return",
+            Self::Medlift => "Medlift to Dust",
+            Self::CourierRun => "Kite Courier Run",
+            Self::DrydockRefit => "Ion Drydock Refit",
+            Self::RelayCalibration => "Relay Calibration Window",
+            Self::OutboundCourier => "Outbound Courier Run",
+            Self::ReturnFreight => "Return Freight Window",
+            Self::PriorityRelay => "Priority Relay Transfer",
+            Self::FrontierSupply => "Frontier Supply Sweep",
+        }
+    }
+
+    pub(crate) fn briefing(self) -> &'static str {
+        match self {
+            Self::SurveyDrop => "Carry survey drones to Dust Harbor and expand the frontier.",
+            Self::ReliefReturn => {
+                "Bring relief crates back from Dust Harbor before local stores spoil."
+            }
+            Self::Medlift => "Rush medical pallets to Dust Harbor on the same shift.",
+            Self::CourierRun => {
+                "Open commercial traffic with Kite Station once the chart is confirmed."
+            }
+            Self::DrydockRefit => {
+                "Deliver replacement coils to Ion Anchorage for a high-value refit."
+            }
+            Self::RelayCalibration => {
+                "Reach Outer Ring Relay and stabilize the signal array before the window closes."
+            }
+            Self::OutboundCourier => {
+                "Push fresh cargo out from Astra Prime to keep the lanes alive."
+            }
+            Self::ReturnFreight => {
+                "Bring station cargo back to Astra Prime for payout and resupply."
+            }
+            Self::PriorityRelay => "Handle a time-sensitive handoff between charted stations.",
+            Self::FrontierSupply => {
+                "Move supplies along the frontier to keep expansion on schedule."
+            }
+        }
+    }
+
+    pub(crate) fn effect_summary(self) -> &'static str {
+        match self {
+            Self::SurveyDrop | Self::FrontierSupply => {
+                "Completion boosts destination station fuel reserves."
+            }
+            Self::ReliefReturn | Self::ReturnFreight => {
+                "Completion improves fuel reserves at Astra Prime."
+            }
+            Self::Medlift | Self::PriorityRelay => {
+                "Completion grants a priority handling credit bonus."
+            }
+            Self::CourierRun | Self::OutboundCourier => {
+                "Fast ships earn a courier speed bonus on completion."
+            }
+            Self::DrydockRefit => "Completion immediately restores the delivery ship to full hull.",
+            Self::RelayCalibration => "Completion triggers a network-wide station fuel boost.",
+        }
+    }
+}
+
 pub(crate) struct Contract {
-    pub(crate) title: &'static str,
-    pub(crate) briefing: &'static str,
+    pub(crate) archetype: ContractArchetype,
+    pub(crate) title: String,
+    pub(crate) briefing: String,
     pub(crate) origin: usize,
     pub(crate) destination: usize,
     pub(crate) reward: i32,
     pub(crate) max_eta: u16,
     pub(crate) deadline: u64,
     pub(crate) unlock_location: usize,
+    pub(crate) pending_llm_flavor: bool,
     pub(crate) state: ContractState,
 }
 
 impl Contract {
     pub(crate) fn new(
-        title: &'static str,
-        briefing: &'static str,
+        archetype: ContractArchetype,
         origin: usize,
         destination: usize,
         reward: i32,
@@ -143,14 +244,16 @@ impl Contract {
         unlock_location: usize,
     ) -> Self {
         Self {
-            title,
-            briefing,
+            archetype,
+            title: archetype.title().to_string(),
+            briefing: archetype.briefing().to_string(),
             origin,
             destination,
             reward,
             max_eta,
             deadline,
             unlock_location,
+            pending_llm_flavor: true,
             state: ContractState::Available,
         }
     }
@@ -190,6 +293,9 @@ impl Location {
 
 pub(crate) enum ShipState {
     Docked,
+    Repairing {
+        ticks_remaining: u16,
+    },
     EnRoute {
         origin: usize,
         destination: usize,
@@ -198,6 +304,7 @@ pub(crate) enum ShipState {
         route: String,
         condition_summary: String,
         assigned_contract: Option<usize>,
+        repair_on_arrival: u16,
     },
 }
 
@@ -207,6 +314,7 @@ pub(crate) struct Ship {
     pub(crate) current_fuel: u16,
     pub(crate) max_fuel: u16,
     pub(crate) speed: u16,
+    pub(crate) hull: u16,
     pub(crate) low_fuel_alerted: bool,
     pub(crate) state: ShipState,
 }
@@ -225,6 +333,7 @@ impl Ship {
             current_fuel,
             max_fuel,
             speed,
+            hull: 100,
             low_fuel_alerted: false,
             state: ShipState::Docked,
         }
@@ -243,6 +352,7 @@ impl Ship {
         current_fuel: u16,
         max_fuel: u16,
         speed: u16,
+        repair_on_arrival: u16,
     ) -> Self {
         Self {
             name,
@@ -250,6 +360,7 @@ impl Ship {
             current_fuel,
             max_fuel,
             speed,
+            hull: 100,
             low_fuel_alerted: false,
             state: ShipState::EnRoute {
                 origin,
@@ -259,6 +370,7 @@ impl Ship {
                 route: route.to_string(),
                 condition_summary: condition_summary.to_string(),
                 assigned_contract,
+                repair_on_arrival,
             },
         }
     }
@@ -279,6 +391,17 @@ impl Ship {
     }
 }
 
+pub(crate) enum UpgradeKind {
+    Engine,
+    FuelTank,
+}
+
+pub(crate) struct UpgradeOffer {
+    pub(crate) kind: UpgradeKind,
+    pub(crate) cost: i32,
+    pub(crate) description: String,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum TransitPhase {
     Undocking,
@@ -292,19 +415,6 @@ impl TransitPhase {
             Self::Undocking => "Undocking",
             Self::Cruising => "Cruising",
             Self::Approach => "Approach",
-        }
-    }
-
-    pub(crate) fn status_line(
-        self,
-        origin: &'static str,
-        destination: &'static str,
-        eta_remaining: u16,
-    ) -> String {
-        match self {
-            Self::Undocking => format!("Undocking from {} | ETA {}", origin, eta_remaining),
-            Self::Cruising => format!("Cruising to {} | ETA {}", destination, eta_remaining),
-            Self::Approach => format!("Approaching {} | ETA {}", destination, eta_remaining),
         }
     }
 }
@@ -370,16 +480,4 @@ impl LaneCondition {
             Self::Solar => "solar static bursts",
         }
     }
-}
-
-pub(super) enum ShipEvent {
-    Departed {
-        name: &'static str,
-        origin: usize,
-        destination: usize,
-    },
-    Approaching {
-        name: &'static str,
-        destination: usize,
-    },
 }

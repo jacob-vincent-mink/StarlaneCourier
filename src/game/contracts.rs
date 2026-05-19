@@ -65,31 +65,12 @@ impl GameData {
         }
     }
 
-    pub(crate) fn contract_hint(&self, index: usize) -> String {
-        let contract = &self.contracts[index];
-
-        match &contract.state {
-            ContractState::Available => contract.briefing.to_string(),
-            ContractState::Accepted { .. } => format!(
-                "Tracked. Dispatch a ship from the contract origin to the listed destination. {}",
-                self.contract_pressure_text(index)
-            ),
-            ContractState::Assigned { ship_name, .. } => format!(
-                "Assigned to {}. Waiting on delivery. {}",
-                ship_name,
-                self.contract_pressure_text(index)
-            ),
-            ContractState::Completed => {
-                "Completed. Reward already banked to the dispatch account.".to_string()
-            }
-            ContractState::Failed => {
-                "Failed. The delivery window was missed on a high-pressure run.".to_string()
-            }
-        }
-    }
-
     pub(crate) fn toggle_contract_tracking(&mut self) {
         let index = self.selected_contract;
+
+        if self.needs_contract_refresh(index) {
+            self.refresh_contract_slot(index);
+        }
 
         if !self.is_contract_unlocked(index) {
             self.push_log(format!(
@@ -181,10 +162,12 @@ impl GameData {
     pub(crate) fn resolve_contract_arrival(
         &mut self,
         contract_index: usize,
+        ship_index: usize,
         ship_name: &'static str,
         destination_index: usize,
     ) {
-        let title = self.contracts[contract_index].title;
+        let title = self.contracts[contract_index].title.clone();
+        let archetype = self.contracts[contract_index].archetype;
 
         match self.contracts[contract_index].state {
             ContractState::Assigned { accepted_at, .. } => {
@@ -203,6 +186,8 @@ impl GameData {
                     destination = self.location_name(destination_index),
                     reward = payout,
                 ));
+                self.apply_contract_archetype_effect(archetype, ship_index, destination_index);
+                self.refresh_contract_slot(contract_index);
             }
             ContractState::Failed => {
                 self.push_log(format!(
@@ -264,5 +249,194 @@ impl GameData {
         for notice in notices {
             self.push_log(notice);
         }
+
+        for index in 0..self.contracts.len() {
+            if self.needs_contract_refresh(index) {
+                self.refresh_contract_slot(index);
+            }
+        }
+    }
+
+    fn needs_contract_refresh(&self, index: usize) -> bool {
+        matches!(
+            self.contracts[index].state,
+            ContractState::Completed | ContractState::Failed
+        )
+    }
+
+    fn refresh_contract_slot(&mut self, index: usize) {
+        let old_title = self.contracts[index].title.clone();
+        let replacement = self.generate_contract_for_slot(index);
+        self.contracts[index] = replacement;
+        if self.tracked_contract == Some(index) {
+            self.tracked_contract = None;
+        }
+        self.push_log(format!(
+            "[{clock:04}] Mission board refreshed: {old} -> {new}.",
+            clock = self.clock,
+            old = old_title,
+            new = self.contracts[index].title,
+        ));
+    }
+
+    fn generate_contract_for_slot(&self, index: usize) -> Contract {
+        let discovered: Vec<usize> = (0..self.locations.len())
+            .filter(|&location| self.is_discovered(location))
+            .collect();
+        let reachable: Vec<usize> = discovered
+            .iter()
+            .copied()
+            .filter(|&location| location != ASTRA_PRIME)
+            .collect();
+
+        let cycle = (self.clock as usize / 8).saturating_add(index);
+        let destination = if reachable.is_empty() {
+            DUST_HARBOR
+        } else {
+            reachable[cycle % reachable.len()]
+        };
+        let origin = if destination == ASTRA_PRIME {
+            discovered[(cycle + 1) % discovered.len()]
+        } else if cycle.is_multiple_of(2) {
+            ASTRA_PRIME
+        } else {
+            destination
+        };
+
+        let destination = if origin == destination {
+            ASTRA_PRIME
+        } else {
+            destination
+        };
+        let destination = if origin == destination {
+            DUST_HARBOR
+        } else {
+            destination
+        };
+
+        let archetype = refresh_archetype(index, origin, destination);
+        let eta_budget = self.estimate_eta_budget(origin, destination);
+        let reward = 120 + i32::from(eta_budget) * 30 + (index as i32 * 15);
+        let deadline = self.clock + u64::from(eta_budget) * 8 + 24;
+        let unlock_location = destination.max(origin);
+
+        Contract::new(
+            archetype,
+            origin,
+            destination,
+            reward,
+            eta_budget,
+            deadline,
+            unlock_location,
+        )
+    }
+
+    fn estimate_eta_budget(&self, origin: usize, destination: usize) -> u16 {
+        let best_speed = self.fleet.iter().map(|ship| ship.speed).max().unwrap_or(1);
+        self.plan_route(origin, destination, best_speed)
+            .map(|plan| plan.eta.saturating_add(1))
+            .unwrap_or(4)
+    }
+
+    fn apply_contract_archetype_effect(
+        &mut self,
+        archetype: ContractArchetype,
+        ship_index: usize,
+        destination_index: usize,
+    ) {
+        match archetype {
+            ContractArchetype::SurveyDrop | ContractArchetype::FrontierSupply => {
+                self.station_fuel[destination_index] = self.station_fuel[destination_index]
+                    .saturating_add(6)
+                    .min(60);
+                self.push_log(format!(
+                    "[{clock:04}] {} receives a frontier supply bonus: +6 station fuel.",
+                    self.location_name(destination_index),
+                    clock = self.clock,
+                ));
+            }
+            ContractArchetype::ReliefReturn | ContractArchetype::ReturnFreight => {
+                self.station_fuel[ASTRA_PRIME] =
+                    self.station_fuel[ASTRA_PRIME].saturating_add(5).min(60);
+                self.push_log(format!(
+                    "[{clock:04}] Astra Prime docks receive a return-freight fuel bonus.",
+                    clock = self.clock,
+                ));
+            }
+            ContractArchetype::Medlift | ContractArchetype::PriorityRelay => {
+                self.credits += 35;
+                self.push_log(format!(
+                    "[{clock:04}] Priority handling bonus: +35 cr.",
+                    clock = self.clock,
+                ));
+            }
+            ContractArchetype::CourierRun | ContractArchetype::OutboundCourier => {
+                if self.fleet[ship_index].speed >= 3 {
+                    self.credits += 25;
+                    self.push_log(format!(
+                        "[{clock:04}] Fast-lane courier bonus: +25 cr.",
+                        clock = self.clock,
+                    ));
+                }
+            }
+            ContractArchetype::DrydockRefit => {
+                self.fleet[ship_index].hull = 100;
+                self.fleet[ship_index].state = ShipState::Docked;
+                self.push_log(format!(
+                    "[{clock:04}] Drydock refit complete: {} leaves port fully repaired.",
+                    self.fleet[ship_index].name,
+                    clock = self.clock,
+                ));
+            }
+            ContractArchetype::RelayCalibration => {
+                for fuel in &mut self.station_fuel {
+                    *fuel = fuel.saturating_add(4).min(60);
+                }
+                self.push_log(format!(
+                    "[{clock:04}] Relay calibration stabilizes convoy timing: all stations gain fuel.",
+                    clock = self.clock,
+                ));
+            }
+        }
+    }
+}
+
+fn refresh_archetype(index: usize, origin: usize, destination: usize) -> ContractArchetype {
+    match (index % 4, origin == ASTRA_PRIME, destination == ASTRA_PRIME) {
+        (0, true, false) => ContractArchetype::OutboundCourier,
+        (1, false, true) => ContractArchetype::ReturnFreight,
+        (2, _, _) => ContractArchetype::PriorityRelay,
+        _ => ContractArchetype::FrontierSupply,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_contract_slot_gets_replaced() {
+        let mut game = GameData::new(Difficulty::Normal);
+        let old_title = game.contracts[0].title.clone();
+        game.contracts[0].state = ContractState::Completed;
+
+        game.refresh_contract_slot(0);
+
+        assert!(matches!(game.contracts[0].state, ContractState::Available));
+        assert_ne!(game.contracts[0].title, old_title);
+    }
+
+    #[test]
+    fn survey_drop_completion_boosts_destination_fuel() {
+        let mut game = GameData::new(Difficulty::Normal);
+        let base_fuel = game.station_fuel[DUST_HARBOR];
+        game.contracts[0].state = ContractState::Assigned {
+            ship_name: "SV Kestrel",
+            accepted_at: 0,
+        };
+
+        game.resolve_contract_arrival(0, 0, "SV Kestrel", DUST_HARBOR);
+
+        assert!(game.station_fuel[DUST_HARBOR] > base_fuel);
     }
 }

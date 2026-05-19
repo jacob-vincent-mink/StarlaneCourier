@@ -56,41 +56,6 @@ impl GameData {
         self.fleet.iter().filter(|ship| !ship.is_docked()).count()
     }
 
-    pub(crate) fn can_complete_route_from(&self, ship_index: usize, destination: usize) -> bool {
-        let ship = &self.fleet[ship_index];
-
-        if !ship.is_docked() {
-            return false;
-        }
-
-        self.plan_route_for_ship(ship_index, destination)
-            .is_some_and(|plan| self.can_stage_route(ship_index, plan.fuel_required))
-    }
-
-    pub(crate) fn can_stage_route(&self, ship_index: usize, fuel_required: u16) -> bool {
-        let ship = &self.fleet[ship_index];
-
-        if !self.difficulty.uses_fuel_economy() {
-            return true;
-        }
-
-        if fuel_required > ship.max_fuel {
-            return false;
-        }
-
-        if ship.current_fuel >= fuel_required {
-            return true;
-        }
-
-        let needed = fuel_required.saturating_sub(ship.current_fuel);
-        let station_available = self.station_fuel[ship.current_location];
-        let affordable_units = (self.credits / self.difficulty.fuel_price_per_unit()).max(0) as u16;
-        let purchasable = station_available.min(affordable_units);
-        let transferable = self.transferable_fuel_for_ship(ship_index);
-
-        purchasable + transferable >= needed
-    }
-
     pub(crate) fn has_viable_progress_path(&self) -> bool {
         if self.fleet.iter().any(|ship| !ship.is_docked()) {
             return true;

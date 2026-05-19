@@ -16,7 +16,9 @@
 - `src/game/fuel.rs` holds refuel, transfer, and fuel-planning rules.
 - `src/game/contracts.rs` holds contract state and payout/deadline rules.
 - `src/game/outcome.rs` holds discovery progression plus win/lose checks.
+- `src/llm.rs` holds OpenAI-compatible contract flavor generation.
 - `src/save.rs` holds save types plus the `SaveStore` persistence boundary.
+- `src/settings.rs` holds persistent app/LLM settings plus the secure `SecretStore` boundary.
 - `src/ui.rs` holds ratatui rendering and text-formatting helpers.
 - The package name in `Cargo.toml` is `starlane-courier`, while the app itself is presented as `Starlane Courier` in the UI and README.
 
@@ -27,8 +29,10 @@
 - The main loop lives in `run_app()`: key handling runs when `event::poll()` returns input, and simulation updates currently happen through `App::tick()` on poll timeouts.
 - `GameData` in `src/game/mod.rs` is the core state boundary. Keep new pure game rules there when possible instead of in `App` or `ui`.
 - Save/load is behind the `SaveStore` trait in `src/save.rs` with `FsSaveStore` for production and a memory-backed test double in unit tests. Prefer extending that boundary instead of adding more direct filesystem access in gameplay code.
+- Persistent non-secret settings are behind `SettingsStore` in `src/settings.rs`, while API keys are behind `SecretStore`. Keep LLM credentials out of save files and general settings JSON.
 
 ## Change Guidance
 
 - Keep changes small and local by default. Prefer putting core rule changes in the relevant `src/game/*.rs` module, shell/menu changes in `src/app.rs`, and purely presentational changes in `src/ui.rs`.
+- Prefer keeping networked LLM behavior in `src/llm.rs` and passing results into the deterministic game core rather than mixing HTTP calls into `src/game/*` modules.
 - After interactive changes, do a quick manual smoke test with `cargo run` to confirm the terminal still restores cleanly after exit.

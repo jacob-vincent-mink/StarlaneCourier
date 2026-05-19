@@ -1,6 +1,8 @@
 mod app;
 mod game;
+mod llm;
 mod save;
+mod settings;
 mod ui;
 
 use std::io;
