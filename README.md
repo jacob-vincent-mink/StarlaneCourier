@@ -38,16 +38,41 @@ Notes:
 
 ## Difficulty
 
-- `Cozy`: fixed rewards, no contract timeout pressure.
-- `Normal`: rewards decay after a contract is accepted, but contracts do not fail.
-- `Insane`: rewards decay faster and accepted contracts can fail if their delivery window expires.
+- `Cozy`: fixed rewards, no fuel pressure, and no win/lose enforcement.
+- `Normal`: fuel costs matter, rewards decay after a contract is accepted, and the run ends if you hit the win condition or run out of viable progress.
+- `Insane`: fuel costs matter, rewards decay faster, accepted contracts can fail if their delivery window expires, and the run ends on win or dead-end loss.
+
+## Win and Lose
+
+- `Normal` and `Insane` have a real end state.
+- Win by charting the full sector and reaching `600` credits.
+- Lose when no viable contract or frontier-progress route remains.
+- In practice, the main failure case is running out of credits needed to refuel ships for meaningful runs.
+
+## Fuel
+
+- Outside `Cozy`, ships have finite fuel reserves and tank sizes.
+- Stations now have finite fuel stock, shown directly on the sector map and in route previews.
+- Route previews show required fuel, fuel aboard, and the current station's fuel stock before launch.
+- Ships do not auto-refuel on dispatch anymore.
+- Use `f` to buy fuel for the selected docked ship from the current station.
+- Use `t` to transfer fuel from another docked ship at the same station.
+- Long routes can become temporarily impossible if a ship's tank is too small or if you cannot afford the refuel.
+- A ship with `0` fuel cannot depart until it is refueled or receives transferred fuel.
+
+## Ship Roles
+
+- Ships now differ by `speed`, `max fuel`, and current fuel reserve.
+- Faster ships can satisfy tighter contract ETA requirements.
+- Larger tanks let ships cover longer routes without extra staging.
+- This means a contract may be feasible for one ship but too slow or too short-ranged for another.
 
 ## Development Checks
 
 Format and compile-check the project with:
 
 ```bash
-cargo fmt && cargo check
+cargo fmt && cargo check && cargo test
 ```
 
 ## Controls
@@ -73,6 +98,8 @@ In game:
 - `Enter` in `Mission Board`: accept or release the selected contract
 - `Enter` in `Fleet`: start route planning for the selected ship
 - `Enter` in `Sector Map`: confirm the selected destination while route planning
+- `f`: refuel the selected docked ship from the current station
+- `t`: transfer fuel from another docked ship at the same station to the selected ship
 - The in-app `Mission` pane explains the current goals, contract flow, and ship phases
 - `Esc`: cancel an in-progress route, or return to the start menu when not route planning
 - `q` or `Ctrl+C`: quit
@@ -81,20 +108,22 @@ In game:
 
 - The current top-level goals are to chart the full sector and reach `600` credits
 - Accept a contract from the `Mission Board`
-- Select a ship in `Fleet` and press `Enter` to plan a route
+- Select a ship in `Fleet`, refuel or transfer fuel if needed, and press `Enter` to plan a route
 - Move to a charted destination on the `Sector Map`
 - Press `Enter` again to confirm the route
 - If the route matches the tracked contract, the ship carries that contract until delivery
+- Outside `Cozy`, route affordability also depends on fuel and refuel cost
 - Watch the ship move through `Undocking`, `Cruising`, `Approach`, and `Arrived`
 
 ## Mission Loop
 
 - The `Mission` pane shows the exploration objective, credit target, tracked contract, and input flow
 - The `Mission Board` now contains structured contracts with origins, destinations, and rewards
+- Contracts also have ETA targets, so a slower ship may not qualify for the same job as a faster one
 - Frontier locations reveal deeper destinations on first arrival, so exploration now has a clear progression goal
 - The early objective chain is: `Dust Harbor` -> `Kite Station` -> `Ion Anchorage` -> `Outer Ring Relay`
 - Ship movement is shown as explicit phases: `Route Planning` -> `Undocking` -> `Cruising` -> `Approach` -> `Arrived`
-- Contract pressure now depends on difficulty: none in `Cozy`, reward decay in `Normal`, and reward decay plus delivery windows in `Insane`
+- Contract pressure now depends on difficulty: none in `Cozy`, reward decay plus bankruptcy risk in `Normal`, and reward decay plus delivery windows in `Insane`
 
 ## Sector Map
 
