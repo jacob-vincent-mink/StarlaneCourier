@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod game;
 mod llm;
@@ -17,11 +18,17 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> io::Result<()> {
-    let mut terminal = setup_terminal()?;
-    let _guard = TerminalGuard;
-    let mut app = App::new();
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--agent") {
+        let mut app = App::new();
+        agent::run_agent_mode(&mut app)
+    } else {
+        let mut terminal = setup_terminal()?;
+        let _guard = TerminalGuard;
+        let mut app = App::new();
 
-    run_app(&mut terminal, &mut app)
+        run_app(&mut terminal, &mut app)
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
