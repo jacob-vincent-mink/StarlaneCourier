@@ -42,6 +42,8 @@ Notes:
 - Non-secret settings are stored in `settings.json` in the project root.
 - The API key is stored separately through the system keyring, not in `settings.json`.
 - Current LLM generation only affects contract flavor text for refreshed contracts; core rewards, ETA targets, and route rules remain deterministic.
+- If LLM mode is enabled but the endpoint cannot be reached at startup, the game now gates startup with a prompt letting you disable LLM mode and continue with the deterministic storyline, retry the connection, open settings, or quit.
+- Provider presets now include a dedicated `OpenAI-Compatible Local` option for local OpenAI-style endpoints such as `http://localhost:8049/v1`.
 - Supported persistent fields:
   - enabled/disabled
   - endpoint URL
@@ -134,6 +136,7 @@ Settings screen:
 - `Left` / `Right`: move between tick speed, difficulty, and LLM fields
 - `Up` / `Down`: move selection inside the focused column
 - `Enter`: apply the selected speed/difficulty or edit/toggle the selected LLM field
+- `c` while focused on the LLM column: test the configured LLM connection
 - `Delete` on the API key field: clear the stored key
 - While editing text: type, `Backspace`, `Enter` to save, `Esc` to cancel
 
@@ -149,6 +152,7 @@ In game:
 - `f`: refuel the selected docked ship from the current station
 - `t`: transfer fuel from another docked ship at the same station to the selected ship
 - `u`: buy the currently suggested upgrade for the selected docked ship
+- `r` while focused on the Mission Board: regenerate the selected contract's flavor via the configured LLM
 - The in-app `Mission` pane explains the current goals, contract flow, and ship phases
 - `Esc`: cancel an in-progress route, or return to the start menu when not route planning
 - `q` or `Ctrl+C`: quit

@@ -18,7 +18,9 @@ impl Difficulty {
 
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Cozy => "No reward decay and no contract failure pressure.",
+            Self::Cozy => {
+                "No reward decay or contract failure pressure, but fuel still costs a little."
+            }
             Self::Normal => "Rewards slowly decay after acceptance, but contracts never fail.",
             Self::Insane => {
                 "Rewards decay faster and accepted contracts fail if their delivery window expires."
@@ -61,12 +63,12 @@ impl Difficulty {
     }
 
     pub(crate) fn uses_fuel_economy(self) -> bool {
-        !matches!(self, Self::Cozy)
+        true
     }
 
     pub(crate) fn fuel_price_per_unit(self) -> i32 {
         match self {
-            Self::Cozy => 0,
+            Self::Cozy => 2,
             Self::Normal => 4,
             Self::Insane => 6,
         }
@@ -93,7 +95,7 @@ impl RunOutcome {
 
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::Won => "You charted the sector and hit the credit target.",
+            Self::Won => "You charted the environment and hit the credit target.",
             Self::Lost { reason } => reason,
         }
     }
@@ -123,24 +125,37 @@ pub(crate) struct Incident {
 #[derive(Clone, Copy)]
 pub(crate) enum AppMode {
     Browse,
-    SelectingDestination { ship_index: usize },
+    SelectingDestination {
+        ship_index: usize,
+        intent: DispatchIntent,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchIntent {
+    Standard,
+    Exploration,
+}
+
+impl DispatchIntent {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Dispatch",
+            Self::Exploration => "Exploration",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ContractState {
     Available,
-    Accepted {
-        accepted_at: u64,
-    },
-    Assigned {
-        ship_name: &'static str,
-        accepted_at: u64,
-    },
+    Accepted { accepted_at: u64 },
+    Assigned { ship_index: usize, accepted_at: u64 },
     Completed,
     Failed,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ContractArchetype {
     SurveyDrop,
     ReliefReturn,
@@ -219,6 +234,7 @@ impl ContractArchetype {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Contract {
     pub(crate) archetype: ContractArchetype,
     pub(crate) title: String,
@@ -259,38 +275,102 @@ impl Contract {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct WorldLocationFlavor {
+    pub(crate) region_name: String,
+    pub(crate) sector_name: String,
+    pub(crate) name: String,
+    pub(crate) short_label: String,
+    pub(crate) lane_name: String,
+    pub(crate) description: String,
+    pub(crate) cluster_name: String,
+    pub(crate) system_name: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorldShipFlavor {
+    pub(crate) name: String,
+    pub(crate) class_name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorldFlavor {
+    pub(crate) environment_name: String,
+    pub(crate) environment_summary: String,
+    pub(crate) locations: Vec<WorldLocationFlavor>,
+    pub(crate) starter_ships: Vec<WorldShipFlavor>,
+    pub(crate) shipyard_offers: Vec<WorldShipFlavor>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MapPoint {
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+}
+
+impl MapPoint {
+    pub(crate) fn as_tuple(self) -> (f64, f64) {
+        (f64::from(self.x), f64::from(self.y))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MapZoom {
+    Region,
+    Sector,
+    Cluster,
+    System,
+}
+
+impl MapZoom {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Region => "Region",
+            Self::Sector => "Sector",
+            Self::Cluster => "Cluster",
+            Self::System => "System",
+        }
+    }
+
+    pub(crate) fn zoom_in(self) -> Self {
+        match self {
+            Self::Region => Self::Sector,
+            Self::Sector => Self::Cluster,
+            Self::Cluster => Self::System,
+            Self::System => Self::System,
+        }
+    }
+
+    pub(crate) fn zoom_out(self) -> Self {
+        match self {
+            Self::Region => Self::Region,
+            Self::Sector => Self::Region,
+            Self::Cluster => Self::Sector,
+            Self::System => Self::Cluster,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct Location {
-    pub(crate) name: &'static str,
-    pub(crate) lane_name: &'static str,
+    pub(crate) region_name: String,
+    pub(crate) sector_name: String,
+    pub(crate) name: String,
+    pub(crate) short_label: String,
+    pub(crate) lane_name: String,
+    pub(crate) description: String,
+    pub(crate) cluster_name: String,
+    pub(crate) system_name: String,
+    pub(crate) region_coords: MapPoint,
+    pub(crate) sector_coords: MapPoint,
+    pub(crate) cluster_coords: MapPoint,
+    pub(crate) system_coords: MapPoint,
     pub(crate) travel_time_from_hub: u16,
     pub(crate) reveal_on_arrival: Option<usize>,
 }
 
-impl Location {
-    pub(crate) fn hub(name: &'static str) -> Self {
-        Self {
-            name,
-            lane_name: "Central Exchange",
-            travel_time_from_hub: 0,
-            reveal_on_arrival: None,
-        }
-    }
-
-    pub(crate) fn new(
-        name: &'static str,
-        lane_name: &'static str,
-        travel_time_from_hub: u16,
-        reveal_on_arrival: Option<usize>,
-    ) -> Self {
-        Self {
-            name,
-            lane_name,
-            travel_time_from_hub,
-            reveal_on_arrival,
-        }
-    }
-}
-
+#[derive(Clone)]
 pub(crate) enum ShipState {
     Docked,
     Repairing {
@@ -301,6 +381,9 @@ pub(crate) enum ShipState {
         destination: usize,
         eta_remaining: u16,
         total_eta: u16,
+        exploration_run: bool,
+        segments: Vec<(usize, usize)>,
+        segment_costs: Vec<u16>,
         route: String,
         condition_summary: String,
         assigned_contract: Option<usize>,
@@ -308,8 +391,11 @@ pub(crate) enum ShipState {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct Ship {
-    pub(crate) name: &'static str,
+    pub(crate) name: String,
+    pub(crate) class_name: String,
+    pub(crate) description: String,
     pub(crate) current_location: usize,
     pub(crate) current_fuel: u16,
     pub(crate) max_fuel: u16,
@@ -321,14 +407,18 @@ pub(crate) struct Ship {
 
 impl Ship {
     pub(crate) fn docked(
-        name: &'static str,
+        name: impl Into<String>,
+        class_name: impl Into<String>,
+        description: impl Into<String>,
         current_location: usize,
         current_fuel: u16,
         max_fuel: u16,
         speed: u16,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
+            class_name: class_name.into(),
+            description: description.into(),
             current_location,
             current_fuel,
             max_fuel,
@@ -341,13 +431,18 @@ impl Ship {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn en_route(
-        name: &'static str,
+        name: impl Into<String>,
+        class_name: impl Into<String>,
+        description: impl Into<String>,
         origin: usize,
         destination: usize,
         eta_remaining: u16,
         total_eta: u16,
-        route: &'static str,
-        condition_summary: &'static str,
+        exploration_run: bool,
+        segments: Vec<(usize, usize)>,
+        segment_costs: Vec<u16>,
+        route: impl Into<String>,
+        condition_summary: impl Into<String>,
         assigned_contract: Option<usize>,
         current_fuel: u16,
         max_fuel: u16,
@@ -355,7 +450,9 @@ impl Ship {
         repair_on_arrival: u16,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
+            class_name: class_name.into(),
+            description: description.into(),
             current_location: origin,
             current_fuel,
             max_fuel,
@@ -367,8 +464,11 @@ impl Ship {
                 destination,
                 eta_remaining,
                 total_eta,
-                route: route.to_string(),
-                condition_summary: condition_summary.to_string(),
+                exploration_run,
+                segments,
+                segment_costs,
+                route: route.into(),
+                condition_summary: condition_summary.into(),
                 assigned_contract,
                 repair_on_arrival,
             },
@@ -376,19 +476,49 @@ impl Ship {
     }
 
     pub(crate) fn is_docked(&self) -> bool {
-        matches!(self.state, ShipState::Docked)
+        matches!(&self.state, ShipState::Docked)
     }
 
     pub(crate) fn map_tag(&self) -> String {
         self.name
             .split_whitespace()
             .last()
-            .unwrap_or(self.name)
+            .unwrap_or(self.name.as_str())
             .chars()
             .take(2)
             .collect::<String>()
             .to_uppercase()
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct ShipShopOffer {
+    pub(crate) name: String,
+    pub(crate) class_name: String,
+    pub(crate) description: String,
+    pub(crate) speed: u16,
+    pub(crate) max_fuel: u16,
+    pub(crate) price: i32,
+}
+
+impl ShipShopOffer {
+    pub(crate) fn to_ship(&self, location: usize) -> Ship {
+        Ship::docked(
+            self.name.clone(),
+            self.class_name.clone(),
+            self.description.clone(),
+            location,
+            self.max_fuel,
+            self.max_fuel,
+            self.speed,
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ShipShop {
+    pub(crate) offers: Vec<ShipShopOffer>,
+    pub(crate) last_refresh: u64,
 }
 
 pub(crate) enum UpgradeKind {
@@ -431,6 +561,8 @@ pub(crate) fn transit_phase(eta_remaining: u16, total_eta: u16) -> TransitPhase 
 
 pub(crate) struct RoutePlan {
     pub(crate) path: String,
+    pub(crate) segments: Vec<(usize, usize)>,
+    pub(crate) segment_costs: Vec<u16>,
     pub(crate) eta: u16,
     pub(crate) fuel_required: u16,
     pub(crate) condition_summary: String,
@@ -438,11 +570,25 @@ pub(crate) struct RoutePlan {
 
 pub(crate) enum RefuelPlan {
     NotNeeded,
-    CanPurchase { units: u16, cost: i32 },
-    NeedTransfer { units: u16 },
+    CanPurchase {
+        units: u16,
+        cost: i32,
+    },
+    EmergencyReserve {
+        purchased_units: u16,
+        reserve_units: u16,
+        cost: i32,
+    },
+    NeedTransfer {
+        units: u16,
+    },
     ExceedsTank,
-    BlockedByCredits { cost: i32 },
-    BlockedByStation { units: u16 },
+    BlockedByCredits {
+        cost: i32,
+    },
+    BlockedByStation {
+        units: u16,
+    },
 }
 
 #[derive(Clone, Copy)]

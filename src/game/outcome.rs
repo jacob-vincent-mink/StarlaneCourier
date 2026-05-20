@@ -24,12 +24,12 @@ impl GameData {
     }
 
     pub(crate) fn discovered_lane_locations(&self) -> Vec<usize> {
-        let mut discovered: Vec<usize> = (1..self.locations.len())
-            .filter(|&index| self.is_discovered(index))
+        let mut discovered: Vec<usize> = (0..self.locations.len())
+            .filter(|&index| self.is_discovered(index) && !self.is_sector_hub(index))
             .collect();
 
         if discovered.is_empty() {
-            discovered.push(ASTRA_PRIME);
+            discovered.push(self.primary_hub_index());
         }
 
         discovered
@@ -71,6 +71,7 @@ impl GameData {
                     for (ship_index, ship) in self.fleet.iter().enumerate() {
                         if ship.is_docked()
                             && ship.current_location == contract.origin
+                            && self.player_can_reach_station_for_operations(ship.current_location)
                             && self
                                 .plan_route_for_ship(ship_index, contract.destination)
                                 .is_some_and(|plan| {
@@ -89,7 +90,11 @@ impl GameData {
 
         for frontier in self.frontier_locations() {
             for ship_index in 0..self.fleet.len() {
-                if self.can_complete_route_from(ship_index, frontier) {
+                if self.can_complete_route_from(ship_index, frontier)
+                    && self.player_can_reach_station_for_operations(
+                        self.fleet[ship_index].current_location,
+                    )
+                {
                     return true;
                 }
             }
@@ -104,10 +109,18 @@ impl GameData {
             }
 
             for ship_index in 0..self.fleet.len() {
-                if self.can_complete_route_from(ship_index, contract.origin) {
+                if self.can_complete_route_from(ship_index, contract.origin)
+                    && self.player_can_reach_station_for_operations(
+                        self.fleet[ship_index].current_location,
+                    )
+                {
                     return true;
                 }
             }
+        }
+
+        if self.can_buy_ship_that_unlocks_progress() {
+            return true;
         }
 
         false
@@ -121,7 +134,7 @@ impl GameData {
         if self.discovered_count() == self.locations.len() && self.credits >= GOAL_CREDITS {
             self.run_outcome = Some(RunOutcome::Won);
             self.push_log(format!(
-                "[{clock:04}] Shift complete. You charted the sector and reached {} credits.",
+                "[{clock:04}] Shift complete. You charted the full environment and reached {} credits.",
                 GOAL_CREDITS,
                 clock = self.clock,
             ));

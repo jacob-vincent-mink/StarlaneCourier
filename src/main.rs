@@ -35,6 +35,7 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
+        app.sync_background_work();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if event::poll(app.poll_duration())? {

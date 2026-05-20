@@ -73,6 +73,10 @@ impl GameData {
         }
 
         if !self.is_contract_unlocked(index) {
+            self.set_action_feedback(format!(
+                "That contract stays locked until {} is charted.",
+                self.location_name(self.contracts[index].unlock_location)
+            ));
             self.push_log(format!(
                 "[{clock:04}] That contract stays locked until {location} is charted.",
                 clock = self.clock,
@@ -84,6 +88,9 @@ impl GameData {
         match self.contracts[index].state {
             ContractState::Available => {
                 if self.tracked_contract.is_some() {
+                    self.set_action_feedback(
+                        "Track or finish the current contract before accepting another.",
+                    );
                     self.push_log(format!(
                         "[{clock:04}] Track or finish the current contract before accepting another.",
                         clock = self.clock,
@@ -112,15 +119,23 @@ impl GameData {
                     title = self.contracts[index].title,
                 ));
             }
-            ContractState::Assigned { ship_name, .. } => {
+            ContractState::Assigned { ship_index, .. } => {
+                self.set_action_feedback(format!(
+                    "{} is already assigned to {}.",
+                    self.contracts[index].title, self.fleet[ship_index].name,
+                ));
                 self.push_log(format!(
                     "[{clock:04}] {title} is already assigned to {ship_name}.",
                     clock = self.clock,
                     title = self.contracts[index].title,
-                    ship_name = ship_name,
+                    ship_name = self.fleet[ship_index].name,
                 ));
             }
             ContractState::Completed => {
+                self.set_action_feedback(format!(
+                    "{} is already complete.",
+                    self.contracts[index].title
+                ));
                 self.push_log(format!(
                     "[{clock:04}] {title} is already complete.",
                     clock = self.clock,
@@ -128,6 +143,10 @@ impl GameData {
                 ));
             }
             ContractState::Failed => {
+                self.set_action_feedback(format!(
+                    "{} has already failed and cannot be reassigned.",
+                    self.contracts[index].title,
+                ));
                 self.push_log(format!(
                     "[{clock:04}] {title} has already failed and cannot be reassigned.",
                     clock = self.clock,
@@ -159,11 +178,52 @@ impl GameData {
             .then_some(contract_index)
     }
 
+    pub(crate) fn active_mission_assignment_note(
+        &self,
+        ship_index: usize,
+        destination: usize,
+        eta: u16,
+    ) -> Option<String> {
+        let contract_index = self.tracked_contract?;
+        let contract = &self.contracts[contract_index];
+        let ship = &self.fleet[ship_index];
+
+        Some(match contract.state {
+            ContractState::Accepted { .. } => {
+                if contract.origin != ship.current_location {
+                    format!(
+                        "Mission assignment: NO - starts at {}",
+                        self.location_name(contract.origin)
+                    )
+                } else if contract.destination != destination {
+                    format!(
+                        "Mission assignment: NO - target is {}",
+                        self.location_name(contract.destination)
+                    )
+                } else if eta > contract.max_eta {
+                    format!(
+                        "Mission assignment: NO - ETA {} exceeds {}",
+                        eta, contract.max_eta
+                    )
+                } else {
+                    "Mission assignment: YES".to_string()
+                }
+            }
+            ContractState::Assigned { ship_index, .. } => format!(
+                "Mission assignment: already carried by {}",
+                self.fleet[ship_index].name
+            ),
+            ContractState::Completed => "Mission assignment: already completed".to_string(),
+            ContractState::Failed => "Mission assignment: already failed".to_string(),
+            ContractState::Available => "Mission assignment: accept mission first".to_string(),
+        })
+    }
+
     pub(crate) fn resolve_contract_arrival(
         &mut self,
         contract_index: usize,
         ship_index: usize,
-        ship_name: &'static str,
+        ship_name: &str,
         destination_index: usize,
     ) {
         let title = self.contracts[contract_index].title.clone();
@@ -178,6 +238,10 @@ impl GameData {
                 self.contracts[contract_index].state = ContractState::Completed;
                 self.tracked_contract = None;
                 self.credits += payout;
+                self.record_mission_history(format!(
+                    "Complete: {} via {} (+{} cr)",
+                    title, ship_name, payout
+                ));
                 self.push_log(format!(
                     "[{clock:04}] Contract complete: {title} via {ship_name} at {destination}. +{reward} cr.",
                     clock = self.clock,
@@ -226,20 +290,28 @@ impl GameData {
                 ContractState::Accepted { .. } => {
                     self.contracts[index].state = ContractState::Failed;
                     self.tracked_contract = None;
+                    self.record_mission_history(format!(
+                        "Failed: {} (expired before launch)",
+                        self.contracts[index].title
+                    ));
                     notices.push(format!(
                         "[{clock:04}] Contract failed: {title} expired before launch.",
                         clock = self.clock,
                         title = self.contracts[index].title,
                     ));
                 }
-                ContractState::Assigned { ship_name, .. } => {
+                ContractState::Assigned { ship_index, .. } => {
                     self.contracts[index].state = ContractState::Failed;
                     self.tracked_contract = None;
+                    self.record_mission_history(format!(
+                        "Failed: {} with {}",
+                        self.contracts[index].title, self.fleet[ship_index].name
+                    ));
                     notices.push(format!(
                         "[{clock:04}] Contract failed: {title} missed its delivery window with {ship_name}.",
                         clock = self.clock,
                         title = self.contracts[index].title,
-                        ship_name = ship_name,
+                        ship_name = self.fleet[ship_index].name,
                     ));
                 }
                 _ => {}
@@ -286,7 +358,12 @@ impl GameData {
         let reachable: Vec<usize> = discovered
             .iter()
             .copied()
-            .filter(|&location| location != ASTRA_PRIME)
+            .filter(|&location| !self.is_sector_hub(location))
+            .collect();
+        let hubs: Vec<usize> = discovered
+            .iter()
+            .copied()
+            .filter(|&location| self.is_sector_hub(location))
             .collect();
 
         let cycle = (self.clock as usize / 8).saturating_add(index);
@@ -295,19 +372,15 @@ impl GameData {
         } else {
             reachable[cycle % reachable.len()]
         };
-        let origin = if destination == ASTRA_PRIME {
-            discovered[(cycle + 1) % discovered.len()]
+        let destination_hub = self.sector_hub_index_for_location(destination);
+        let origin = if hubs.len() > 1 && cycle.is_multiple_of(3) {
+            hubs[(cycle + 1) % hubs.len()]
         } else if cycle.is_multiple_of(2) {
-            ASTRA_PRIME
+            self.primary_hub_index()
         } else {
-            destination
+            destination_hub
         };
 
-        let destination = if origin == destination {
-            ASTRA_PRIME
-        } else {
-            destination
-        };
         let destination = if origin == destination {
             DUST_HARBOR
         } else {
@@ -356,10 +429,11 @@ impl GameData {
                 ));
             }
             ContractArchetype::ReliefReturn | ContractArchetype::ReturnFreight => {
-                self.station_fuel[ASTRA_PRIME] =
-                    self.station_fuel[ASTRA_PRIME].saturating_add(5).min(60);
+                let home_hub = self.primary_hub_index();
+                self.station_fuel[home_hub] = self.station_fuel[home_hub].saturating_add(5).min(60);
                 self.push_log(format!(
-                    "[{clock:04}] Astra Prime docks receive a return-freight fuel bonus.",
+                    "[{clock:04}] {} docks receive a return-freight fuel bonus.",
+                    self.location_name(home_hub),
                     clock = self.clock,
                 ));
             }
@@ -402,7 +476,9 @@ impl GameData {
 }
 
 fn refresh_archetype(index: usize, origin: usize, destination: usize) -> ContractArchetype {
-    match (index % 4, origin == ASTRA_PRIME, destination == ASTRA_PRIME) {
+    let origin_is_hub = origin % SECTOR_LOCATION_COUNT == 0;
+    let destination_is_hub = destination % SECTOR_LOCATION_COUNT == 0;
+    match (index % 4, origin_is_hub, destination_is_hub) {
         (0, true, false) => ContractArchetype::OutboundCourier,
         (1, false, true) => ContractArchetype::ReturnFreight,
         (2, _, _) => ContractArchetype::PriorityRelay,
@@ -431,12 +507,13 @@ mod tests {
         let mut game = GameData::new(Difficulty::Normal);
         let base_fuel = game.station_fuel[DUST_HARBOR];
         game.contracts[0].state = ContractState::Assigned {
-            ship_name: "SV Kestrel",
+            ship_index: 0,
             accepted_at: 0,
         };
 
         game.resolve_contract_arrival(0, 0, "SV Kestrel", DUST_HARBOR);
 
         assert!(game.station_fuel[DUST_HARBOR] > base_fuel);
+        assert!(game.mission_history[0].starts_with("Complete: Front"));
     }
 }

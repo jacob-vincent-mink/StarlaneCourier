@@ -5,7 +5,7 @@ use ratatui::{
     symbols::Marker,
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
         canvas::{Canvas, Line as CanvasLine, Points},
     },
 };
@@ -13,22 +13,126 @@ use ratatui::{
 use crate::{
     app::{App, DIFFICULTY_OPTIONS, LLM_FIELDS, Screen, TICK_SPEEDS},
     game::{
-        ASTRA_PRIME, CONTRACTS_PANE, DUST_HARBOR, Difficulty, FLEET_PANE, GOAL_CREDITS,
-        ION_ANCHORAGE, KITE_STATION, LOG_PANE, Location, MAP_PANE, OUTER_RING_RELAY, PANE_TITLES,
-        RefuelPlan, RunOutcome, Ship, ShipState, transit_phase,
+        CONTRACTS_PANE, Difficulty, FLEET_PANE, GOAL_CREDITS, LOG_PANE, Location, MAP_PANE,
+        PANE_TITLES, RefuelPlan, RunOutcome, SECTOR_LOCATION_COUNT, SHIPYARD_PANE, Ship,
+        ShipShopOffer, ShipState, transit_phase,
     },
+    llm::PROMPT_CATALOG,
     save::SAVE_SLOT_COUNT,
 };
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
+        Screen::LlmGate => draw_llm_gate(frame, app),
         Screen::StartMenu => draw_start_menu(frame, app),
         Screen::LoadGame => draw_load_game(frame, app),
+        Screen::InitializingWorld => draw_initializing_world(frame, app),
         Screen::Settings => draw_settings(frame, app),
         Screen::HowToPlay => draw_how_to_play(frame, app),
         Screen::InGame => draw_game(frame, app),
         Screen::EndGame => draw_end_game(frame, app),
     }
+}
+
+fn draw_initializing_world(frame: &mut Frame, app: &App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            "Initializing Your Environment",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Seeding the first playable environment before opening the bridge."),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Bootstrap"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(header, areas[0]);
+
+    let seed = app.pending_world_seed().unwrap_or(app.world_seed);
+    let body = Paragraph::new(Text::from(vec![
+        Line::from(format!("Seed: {}", seed)),
+        Line::from(format!("Target environment: {}", app.sector_name)),
+        Line::from(""),
+        Line::from(app.llm_summary()),
+        Line::from(format!("Last LLM status: {}", app.last_llm_status)),
+        Line::from(""),
+        Line::from(app.sector_summary.clone()),
+        Line::from(""),
+        Line::from("Boot sequence:"),
+        Line::from("1. Resolve seeded sector identity and station names."),
+        Line::from("2. Prepare the first charted frontier environment."),
+        Line::from("3. Open the bridge once the environment is ready."),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Status"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, areas[1]);
+
+    let footer = Paragraph::new(Line::from("Esc: cancel to menu   q/Ctrl+C: quit"))
+        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, areas[2]);
+}
+
+fn draw_llm_gate(frame: &mut Frame, app: &App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(areas[1]);
+
+    let header = Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(
+            "LLM Connection Required",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("LLM mode is enabled, but the configured OpenAI-compatible endpoint is not currently available."),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Connection Gate"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(header, areas[0]);
+
+    let options = app.llm_gate_options();
+    let menu = List::new(options.iter().map(|option| ListItem::new(option.label())))
+        .highlight_style(selection_style())
+        .highlight_symbol(">> ")
+        .block(Block::default().borders(Borders::ALL).title("Choices"));
+    let mut state = ListState::default();
+    state.select(Some(app.llm_gate_selection));
+    frame.render_stateful_widget(menu, body[0], &mut state);
+
+    let detail = Paragraph::new(Text::from(vec![
+        Line::from("Detected issue:"),
+        Line::from(app.menu_feedback.clone().unwrap_or_else(|| "LLM connection not available.".to_string())),
+        Line::from(""),
+        Line::from(app.llm_summary()),
+        Line::from(format!("Last LLM status: {}", app.last_llm_status)),
+        Line::from(""),
+        Line::from("Disable LLM to continue with the deterministic storyline, retry the connection, or open Settings to fix the endpoint/model/key."),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Status"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(detail, body[1]);
+
+    let footer = Paragraph::new(Line::from(
+        "Up/Down: choose   Enter: confirm   q/Ctrl+C: quit",
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, areas[2]);
 }
 
 fn draw_game(frame: &mut Frame, app: &App) {
@@ -59,10 +163,18 @@ fn draw_game(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(bottom[0]);
+    let right_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(bottom[1]);
 
     let map_sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(7)])
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ])
         .split(top[1]);
     let board_sections = Layout::default()
         .direction(Direction::Vertical)
@@ -75,6 +187,10 @@ fn draw_game(frame: &mut Frame, app: &App) {
 
     let header = Paragraph::new(Line::from(vec![
         "Starlane Courier".into(),
+        "  ".into(),
+        format!("Sector: {}", app.sector_name).into(),
+        "  ".into(),
+        format!("Player: {}", app.player_status_text()).into(),
         "  ".into(),
         format!("Shift window: T+{:04}", app.clock).into(),
         "  ".into(),
@@ -126,6 +242,11 @@ fn draw_game(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(route_intel, map_sections[1]);
 
+    let station_info = Paragraph::new(Text::from(station_info_lines(app)))
+        .block(Block::default().borders(Borders::ALL).title("Station Info"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(station_info, map_sections[2]);
+
     let fleet = List::new(app.fleet.iter().enumerate().map(|(index, ship)| {
         ship_list_item(
             ship,
@@ -165,17 +286,37 @@ fn draw_game(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(alerts, alert_sections[0], &mut alerts_state);
 
     let log = List::new(app.log.iter().map(|entry| ListItem::new(entry.as_str())))
-        .block(pane_block(PANE_TITLES[3], app.active_pane == LOG_PANE));
+        .block(pane_block(PANE_TITLES[4], app.active_pane == LOG_PANE));
     frame.render_widget(log, alert_sections[1]);
 
     let mission = Paragraph::new(Text::from(build_mission_text(app)))
         .block(Block::default().borders(Borders::ALL).title("Mission"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(mission, bottom[1]);
+    frame.render_widget(mission, right_sections[0]);
+
+    let shipyard = List::new(shipyard_list_items(app))
+        .highlight_style(selection_style())
+        .highlight_symbol("$$ ")
+        .block(pane_block(PANE_TITLES[3], app.active_pane == SHIPYARD_PANE));
+    let mut shipyard_state = ListState::default();
+    let shipyard_count = app.shipyard_offer_count(app.selected_location);
+    shipyard_state.select(
+        (shipyard_count > 0).then_some(app.selected_shipyard_offer.min(shipyard_count - 1)),
+    );
+    frame.render_stateful_widget(shipyard, right_sections[1], &mut shipyard_state);
 
     let footer = Paragraph::new(Line::from(app.controls_text()))
         .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, areas[3]);
+
+    if let Some(message) = &app.popup_message {
+        draw_popup(
+            frame,
+            "Notification",
+            message,
+            "Any key: dismiss   q/Ctrl+C: quit",
+        );
+    }
 }
 
 fn draw_start_menu(frame: &mut Frame, app: &App) {
@@ -200,7 +341,7 @@ fn draw_start_menu(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(
-            "Run a frontier dispatch shift: chart the sector, take contracts, and grow credits.",
+            "Run a frontier dispatch shift: chart the environment, take contracts, and grow credits.",
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Launch Bay"))
@@ -240,6 +381,7 @@ fn draw_start_menu(frame: &mut Frame, app: &App) {
             TICK_SPEEDS[app.tick_speed_index].0, TICK_SPEEDS[app.tick_speed_index].1,
         )),
         Line::from(app.llm_summary()),
+        Line::from(format!("Last LLM status: {}", app.last_llm_status)),
         Line::from("Contracts reward credits; frontier arrivals reveal deeper routes."),
         Line::from(""),
         Line::from(
@@ -411,6 +553,12 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(llm_list, body[2], &mut llm_state);
 
     let selected_field = app.selected_llm_field();
+    let primary_prompt = PROMPT_CATALOG[0];
+    let prompt_names = PROMPT_CATALOG
+        .iter()
+        .map(|prompt| prompt.name)
+        .collect::<Vec<_>>()
+        .join(", ");
     let detail = Paragraph::new(Text::from(vec![
         Line::from("Simulation speed controls how fast route ETAs and ambient events advance."),
         Line::from(
@@ -432,10 +580,20 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         Line::from(app.llm_field_description(selected_field)),
         Line::from(""),
         Line::from(app.llm_summary()),
+        Line::from(format!("Last status: {}", app.last_llm_status)),
+        Line::from(format!(
+            "Prompt catalog: {} template(s) loaded.",
+            PROMPT_CATALOG.len()
+        )),
+        Line::from(format!("Active prompts: {}", prompt_names)),
+        Line::from(format!(
+            "Primary prompt: {} -> {}",
+            primary_prompt.name, primary_prompt.output
+        )),
         Line::from(if app.settings_edit.is_some() {
             "Editing: type text, Backspace, Enter to save, Esc to cancel".to_string()
         } else {
-            "Settings: Enter edits/toggles the selected field; Delete clears API key".to_string()
+            "Settings: Enter edits/toggles the selected field; `c` tests the LLM connection; Delete clears the API key".to_string()
         }),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Effect"))
@@ -443,7 +601,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     frame.render_widget(detail, body[3]);
 
     let footer = Paragraph::new(Line::from(
-        "Left/Right: focus   Up/Down: choose   Enter: apply/edit   Delete: clear API key   Esc: back   q/Ctrl+C: quit",
+        "Left/Right: focus   Up/Down: choose   Enter: apply/edit   c: test LLM   Delete: clear API key   Esc: back   q/Ctrl+C: quit",
     ))
     .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, areas[2]);
@@ -468,20 +626,30 @@ fn draw_how_to_play(frame: &mut Frame, app: &App) {
 
     let body = Paragraph::new(Text::from(vec![
         Line::from(format!(
-            "Primary goals: chart the full sector and reach {} credits.",
+            "Primary goals: chart the full environment and reach {} credits.",
             GOAL_CREDITS
         )),
         Line::from("1. Accept a contract from the Mission Board."),
         Line::from("2. Refuel with `f` or transfer dockside fuel with `t` if needed."),
         Line::from("3. Upgrade a docked ship with `u` if you need more speed or range."),
-        Line::from("4. Move to Fleet and press Enter on a docked ship."),
-        Line::from("5. Focus the map, pick the contract destination, and confirm the route."),
-        Line::from("6. Watch the ship move through undocking, cruising, incidents, and arrival."),
-        Line::from("7. Use Alerts with Enter to jump to urgent ships, stations, or contracts."),
-        Line::from("8. Frontier arrivals reveal new charts and unlock deeper contracts."),
+        Line::from("4. Move to Fleet and press Enter on a docked ship for a normal dispatch."),
+        Line::from(
+            "5. Press `e` on a docked ship to arm an exploration run toward a frontier node.",
+        ),
+        Line::from("6. Focus the map, pick the destination, and confirm the route."),
+        Line::from(
+            "7. Exploration runs uncover hidden contacts only when you arrive at frontier nodes.",
+        ),
+        Line::from("8. You can only operate docked ships at your current location."),
+        Line::from("9. Use `m` on the map to take a paid passenger transfer to another discovered station."),
+        Line::from("10. Some hubs and anchorages host shipyards with generated hull offers."),
+        Line::from("11. Select a charted station in the map pane and press `b` to buy a ship if you can afford it."),
+        Line::from("12. Use Alerts with Enter to jump to urgent ships, stations, or contracts."),
+        Line::from("13. Contracts, exploration, and shipyards all compete for fuel and credits."),
+        Line::from("14. Watch ships move through undocking, cruising, incidents, and arrival."),
         Line::from(""),
         Line::from("Difficulties:"),
-        Line::from("Cozy: fixed rewards, no timeout pressure, no fuel economy."),
+        Line::from("Cozy: fixed rewards, no timeout pressure, light fuel costs with emergency reserve top-offs."),
         Line::from("Normal: fuel costs matter and rewards decay after acceptance."),
         Line::from("Insane: faster reward decay plus hard delivery-window failures."),
         Line::from(""),
@@ -570,6 +738,44 @@ fn pane_block(title: &'static str, active: bool) -> Block<'static> {
         .border_style(border_style)
 }
 
+fn draw_popup(frame: &mut Frame, title: &'static str, message: &str, footer: &str) {
+    let area = centered_rect(64, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .split(area);
+
+    let body = Paragraph::new(Text::from(vec![Line::from(message.to_string())]))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, sections[0]);
+
+    let controls = Paragraph::new(Line::from(footer))
+        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(controls, sections[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 fn selection_style() -> Style {
     Style::default()
         .fg(Color::Black)
@@ -579,6 +785,7 @@ fn selection_style() -> Style {
 
 fn render_sector_map(frame: &mut Frame, area: Rect, app: &App, active: bool) {
     let origin = app.preview_origin();
+    let scope = app.map_scope_locations();
 
     let canvas = Canvas::default()
         .block(pane_block(PANE_TITLES[1], active))
@@ -587,13 +794,13 @@ fn render_sector_map(frame: &mut Frame, area: Rect, app: &App, active: bool) {
         .x_bounds([0.0, 100.0])
         .y_bounds([0.0, 60.0])
         .paint(|ctx| {
-            for index in 0..app.locations.len() {
+            for &index in &scope {
                 if app.is_discovered(index) {
                     continue;
                 }
 
-                let cloud = hidden_cloud_points(index);
-                let (label_x, label_y) = location_label_coords(index);
+                let cloud = hidden_cloud_points(app.map_coords(index));
+                let (label_x, label_y) = location_label_coords(app, index);
                 ctx.draw(&Points {
                     coords: &cloud,
                     color: Color::DarkGray,
@@ -610,87 +817,108 @@ fn render_sector_map(frame: &mut Frame, area: Rect, app: &App, active: bool) {
                 );
             }
 
-            let (hub_x, hub_y) = location_coords(ASTRA_PRIME);
-            for leaf in 1..app.locations.len() {
-                if !app.is_discovered(leaf) {
+            for (start, end) in app.visible_map_links() {
+                if !app.is_discovered(start) || !app.is_discovered(end) {
                     continue;
                 }
 
-                let (x, y) = location_coords(leaf);
-                ctx.draw(&CanvasLine::new(hub_x, hub_y, x, y, Color::DarkGray));
+                let (x1, y1) = app.map_coords(start);
+                let (x2, y2) = app.map_coords(end);
+                ctx.draw(&CanvasLine::new(x1, y1, x2, y2, Color::DarkGray));
             }
 
-            if let Some((from, to)) = app.highlighted_route() {
-                for (start, end) in route_segments(from, to) {
-                    let (x1, y1) = location_coords(start);
-                    let (x2, y2) = location_coords(end);
+            if let Some(segments) = app.highlighted_route_segments() {
+                for (start, end) in segments {
+                    let (x1, y1) = app.map_coords(start);
+                    let (x2, y2) = app.map_coords(end);
                     ctx.draw(&CanvasLine::new(x1, y1, x2, y2, Color::Cyan));
                 }
             }
 
-            for index in 0..app.locations.len() {
+            for &index in &scope {
                 if !app.is_discovered(index) {
                     continue;
                 }
 
-                let color = location_color(app, index, origin);
                 let label = if app.is_frontier_location(index) {
-                    format!("{}*", map_label(index))
+                    format!("{}*", map_label(app, index))
                 } else {
-                    map_label(index).to_string()
+                    map_label(app, index).to_string()
                 };
-                let (x, y) = location_coords(index);
-                let (label_x, label_y) = location_label_coords(index);
-                let points = node_points(x, y);
-                ctx.draw(&Points {
-                    coords: &points,
-                    color,
-                });
+                let (x, y) = app.map_coords(index);
+                let (label_x, label_y) = location_label_coords(app, index);
+                ctx.print(
+                    x,
+                    y,
+                    Span::styled(
+                        node_glyph(app, index, origin),
+                        node_style(app, index, origin),
+                    ),
+                );
                 ctx.print(
                     label_x,
                     label_y,
                     Span::styled(label, location_label_style(app, index, origin)),
                 );
-                ctx.print(
-                    label_x,
-                    label_y - 3.0,
-                    Span::styled(
-                        format!("F{}", app.station_fuel[index]),
-                        station_fuel_style(app, index),
-                    ),
-                );
+                if index == app.player_location && !app.player_is_in_transit() {
+                    ctx.print(
+                        x - 2.0,
+                        y - 2.0,
+                        Span::styled("P", player_marker_style(app, index)),
+                    );
+                }
+                if app.has_shipyard(index) {
+                    ctx.print(
+                        x + 2.0,
+                        y - 2.0,
+                        Span::styled("$", shipyard_marker_style(app, index)),
+                    );
+                }
             }
 
             let mut dock_slots = vec![0usize; app.locations.len()];
             for (ship_index, ship) in app.fleet.iter().enumerate() {
                 match &ship.state {
                     ShipState::Docked | ShipState::Repairing { .. } => {
-                        if !app.is_discovered(ship.current_location) {
+                        if !app.is_discovered(ship.current_location)
+                            || !app.location_visible_in_map(ship.current_location)
+                        {
                             continue;
                         }
 
-                        let slot = dock_slots[ship.current_location];
-                        dock_slots[ship.current_location] += 1;
-                        let (base_x, base_y) = location_coords(ship.current_location);
-                        let (offset_x, offset_y) = docked_ship_offset(slot);
-                        ctx.print(
-                            base_x + offset_x,
-                            base_y + offset_y,
-                            Span::styled(ship.map_tag(), ship_style(app, ship_index)),
-                        );
+                        let (base_x, base_y) = app.map_coords(ship.current_location);
+                        if show_individual_ship_tags(app) {
+                            let slot = dock_slots[ship.current_location];
+                            dock_slots[ship.current_location] += 1;
+                            let (offset_x, offset_y) = docked_ship_offset(slot);
+                            ctx.print(
+                                base_x + offset_x,
+                                base_y + offset_y,
+                                Span::styled(ship.map_tag(), ship_style(app, ship_index)),
+                            );
+                        }
                     }
                     ShipState::EnRoute {
-                        origin,
-                        destination,
                         eta_remaining,
                         total_eta,
+                        segments,
+                        segment_costs,
                         ..
                     } => {
-                        let position = interpolate(
-                            location_coords(*origin),
-                            location_coords(*destination),
-                            transit_progress(*eta_remaining, *total_eta),
-                        );
+                        let Some(((start, end), position)) = route_position(
+                            app,
+                            segments,
+                            segment_costs,
+                            *eta_remaining,
+                            *total_eta,
+                        ) else {
+                            continue;
+                        };
+                        if !app.location_visible_in_map(start) || !app.location_visible_in_map(end)
+                        {
+                            continue;
+                        }
+
                         let point = [position];
                         ctx.draw(&Points {
                             coords: &point,
@@ -754,25 +982,30 @@ fn build_mission_text(app: &App) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "Chart the full sector ({}/{}) and reach {} credits",
+            "Chart the full environment ({}/{}) and reach {} credits",
             app.discovered_count(),
             app.locations.len(),
             GOAL_CREDITS,
         )),
     ])];
+    lines.push(Line::from(format!(
+        "Sector {} | seed {}",
+        app.sector_name, app.world_seed
+    )));
+    lines.push(Line::from(app.sector_summary.clone()));
 
-    if let Some((frontier, reveal)) = app.next_discovery_target() {
+    if let Some((frontier, _reveal)) = app.next_discovery_target() {
         lines.push(Line::from(format!(
-            "Next lead: send a ship to {}",
+            "Next lead: send an exploration run to {}",
             app.location_name(frontier)
         )));
-        lines.push(Line::from(format!(
-            "That unlocks: {}",
-            app.location_name(reveal)
-        )));
+        let heading = app
+            .exploration_heading_hint(frontier)
+            .unwrap_or_else(|| "into the unknown".to_string());
+        lines.push(Line::from(format!("Hidden contact heading: {}", heading)));
     } else {
         lines.push(Line::from(
-            "Sector charted: all known contacts are visible.",
+            "Environment charted: all known contacts are visible.",
         ));
         lines.push(Line::from(
             "Focus on clearing the remaining contract board for credits.",
@@ -782,7 +1015,7 @@ fn build_mission_text(app: &App) -> Vec<Line<'static>> {
     if let Some(contract_index) = app.tracked_contract {
         let contract = &app.contracts[contract_index];
         lines.push(Line::from(format!(
-            "Tracked: {} [{}]",
+            "Active mission: {} [{}]",
             contract.title,
             app.contract_status_label(contract_index)
         )));
@@ -793,11 +1026,49 @@ fn build_mission_text(app: &App) -> Vec<Line<'static>> {
             app.contract_current_reward(contract_index),
             contract.max_eta,
         )));
+        if let crate::game::ContractState::Assigned { ship_index, .. } = contract.state {
+            lines.push(Line::from(format!(
+                "Assigned carrier: {}",
+                app.fleet[ship_index].name
+            )));
+        }
         lines.push(Line::from(app.contract_pressure_text(contract_index)));
     } else {
-        lines.push(Line::from(
-            "Tracked contract: none. Accept one from the Mission Board.",
-        ));
+        let assigned: Vec<usize> = app
+            .contracts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, contract)| {
+                matches!(contract.state, crate::game::ContractState::Assigned { .. })
+                    .then_some(index)
+            })
+            .collect();
+
+        if let Some(&contract_index) = assigned.first() {
+            let contract = &app.contracts[contract_index];
+            lines.push(Line::from(format!(
+                "Assigned: {} [{}]",
+                contract.title,
+                app.contract_status_label(contract_index)
+            )));
+            lines.push(Line::from(format!(
+                "Run: {} -> {} | reward {} cr | ETA <= {}",
+                app.location_name(contract.origin),
+                app.location_name(contract.destination),
+                app.contract_current_reward(contract_index),
+                contract.max_eta,
+            )));
+            if assigned.len() > 1 {
+                lines.push(Line::from(format!(
+                    "Assigned runs in transit: {}",
+                    assigned.len()
+                )));
+            }
+        } else {
+            lines.push(Line::from(
+                "Tracked contract: none. Accept one from the Mission Board.",
+            ));
+        }
     }
 
     lines.push(Line::from(format!(
@@ -807,19 +1078,34 @@ fn build_mission_text(app: &App) -> Vec<Line<'static>> {
         app.in_transit_count(),
         app.fleet.len() - app.in_transit_count()
     )));
+    if !app.mission_history.is_empty() {
+        lines.push(Line::from("Recent missions:"));
+        for entry in app.mission_history.iter().take(3) {
+            lines.push(Line::from(entry.clone()));
+        }
+    }
     lines.push(Line::from(format!(
         "Difficulty: {}",
         app.difficulty.label()
     )));
+    if app.pending_contract_flavor_count() > 0 {
+        lines.push(Line::from(format!(
+            "LLM: {} contract flavor job(s) running in background.",
+            app.pending_contract_flavor_count()
+        )));
+    }
     let low_fuel = app.low_fuel_ship_names();
     if !low_fuel.is_empty() {
         lines.push(Line::from(format!("Low fuel: {}", low_fuel.join(", "))));
     }
     lines.push(Line::from(
-        "Flow: Board -> Enter -> Fleet -> Enter -> charted node -> Enter.",
+        "Flow: Board -> Enter or Fleet -> Enter dispatch / e exploration -> charted node -> Enter.",
     ));
     lines.push(Line::from(
         "Transit: route planning -> undocking -> cruising -> approach -> arrived.",
+    ));
+    lines.push(Line::from(
+        "Map hierarchy: Region -> Sector -> Cluster -> System with z/x zoom and g auto-focus.",
     ));
 
     match app.mode {
@@ -828,7 +1114,7 @@ fn build_mission_text(app: &App) -> Vec<Line<'static>> {
                 "Legend: cyan=selected yellow=origin magenta=frontier gray=unknown.",
             ));
         }
-        crate::game::AppMode::SelectingDestination { ship_index } => {
+        crate::game::AppMode::SelectingDestination { ship_index, .. } => {
             lines.push(Line::from(format!(
                 "Dispatch armed: choose a destination for {}.",
                 app.fleet[ship_index].name
@@ -859,21 +1145,8 @@ fn location_label_style(app: &App, index: usize, origin: Option<usize>) -> Style
     }
 }
 
-fn station_fuel_style(app: &App, index: usize) -> Style {
-    let fuel = app.station_fuel[index];
-    let color = if fuel <= 4 {
-        Color::Red
-    } else if fuel <= 10 {
-        Color::Yellow
-    } else {
-        Color::Gray
-    };
-
-    Style::default().fg(color)
-}
-
 fn ship_color(app: &App, ship_index: usize) -> Color {
-    if matches!(app.fleet[ship_index].state, ShipState::Repairing { .. }) {
+    if matches!(&app.fleet[ship_index].state, ShipState::Repairing { .. }) {
         Color::Red
     } else if app.pending_ship() == Some(ship_index) {
         Color::Green
@@ -890,51 +1163,67 @@ fn ship_style(app: &App, ship_index: usize) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn location_coords(index: usize) -> (f64, f64) {
-    match index {
-        ASTRA_PRIME => (50.0, 30.0),
-        KITE_STATION => (18.0, 30.0),
-        ION_ANCHORAGE => (82.0, 30.0),
-        DUST_HARBOR => (50.0, 10.0),
-        OUTER_RING_RELAY => (50.0, 52.0),
-        _ => (50.0, 30.0),
+fn location_label_coords(app: &App, index: usize) -> (f64, f64) {
+    let (x, y) = app.map_coords(index);
+    let role = location_role(index);
+    match app.map_zoom {
+        crate::game::MapZoom::Region => (x - 6.0, y + 3.0),
+        crate::game::MapZoom::Sector => match role {
+            0 => (x - 2.0, y - 3.0),
+            1 => (x + 2.0, y - 2.0),
+            2 => (x - 5.0, y + 2.0),
+            3 => (x - 3.0, y + 3.0),
+            _ => (x + 2.0, y + 2.0),
+        },
+        crate::game::MapZoom::Cluster => match role {
+            0 => (x - 2.0, y - 3.0),
+            1 => (x + 2.0, y - 2.0),
+            2 => (x - 5.0, y + 2.0),
+            3 => (x - 3.0, y + 3.0),
+            _ => (x + 2.0, y + 2.0),
+        },
+        crate::game::MapZoom::System => match role {
+            0 => (x - 2.0, y - 3.0),
+            1 => (x + 2.0, y - 2.0),
+            2 => (x - 5.0, y + 2.0),
+            3 => (x - 3.0, y + 3.0),
+            _ => (x + 2.0, y + 2.0),
+        },
     }
 }
 
-fn location_label_coords(index: usize) -> (f64, f64) {
-    match index {
-        ASTRA_PRIME => (43.0, 25.0),
-        KITE_STATION => (7.0, 35.0),
-        ION_ANCHORAGE => (75.0, 35.0),
-        DUST_HARBOR => (44.0, 4.0),
-        OUTER_RING_RELAY => (43.0, 56.0),
-        _ => (43.0, 25.0),
+fn map_label(app: &App, index: usize) -> &str {
+    match app.map_zoom {
+        crate::game::MapZoom::Region => app.location_sector(index),
+        crate::game::MapZoom::Sector => app.location_short_label(index),
+        crate::game::MapZoom::Cluster => app.location_short_label(index),
+        crate::game::MapZoom::System => app.location_name(index),
     }
 }
 
-fn map_label(index: usize) -> &'static str {
-    match index {
-        ASTRA_PRIME => "Astra",
-        KITE_STATION => "Kite",
-        ION_ANCHORAGE => "Ion",
-        DUST_HARBOR => "Dust",
-        OUTER_RING_RELAY => "Relay",
-        _ => "Unknown",
+fn node_glyph(app: &App, index: usize, origin: Option<usize>) -> &'static str {
+    if Some(index) == origin {
+        "@"
+    } else if index == app.selected_location {
+        "O"
+    } else if app.is_frontier_location(index) {
+        "*"
+    } else if app.is_sector_hub(index) {
+        "#"
+    } else {
+        "o"
     }
 }
 
-fn node_points(x: f64, y: f64) -> [(f64, f64); 5] {
-    [
-        (x, y),
-        (x - 1.0, y),
-        (x + 1.0, y),
-        (x, y - 1.0),
-        (x, y + 1.0),
-    ]
+fn node_style(app: &App, index: usize, origin: Option<usize>) -> Style {
+    let mut style = Style::default().fg(location_color(app, index, origin));
+    if index == app.selected_location || Some(index) == origin || app.is_frontier_location(index) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
 }
 
-fn hidden_cloud_points(index: usize) -> Vec<(f64, f64)> {
-    let (x, y) = location_coords(index);
+fn hidden_cloud_points((x, y): (f64, f64)) -> Vec<(f64, f64)> {
     vec![
         (x - 5.0, y + 1.0),
         (x - 3.0, y + 3.0),
@@ -949,11 +1238,22 @@ fn hidden_cloud_points(index: usize) -> Vec<(f64, f64)> {
 
 fn docked_ship_offset(slot: usize) -> (f64, f64) {
     match slot {
-        0 => (-5.0, -4.0),
-        1 => (3.0, -4.0),
-        2 => (-5.0, 4.0),
-        _ => (3.0, 4.0),
+        0 => (-8.0, -6.0),
+        1 => (7.0, -6.0),
+        2 => (-8.0, 6.0),
+        _ => (7.0, 6.0),
     }
+}
+
+fn location_role(index: usize) -> usize {
+    index % SECTOR_LOCATION_COUNT
+}
+
+fn show_individual_ship_tags(app: &App) -> bool {
+    matches!(
+        app.map_zoom,
+        crate::game::MapZoom::Cluster | crate::game::MapZoom::System
+    )
 }
 
 fn transit_progress(eta_remaining: u16, total_eta: u16) -> f64 {
@@ -968,23 +1268,133 @@ fn interpolate(start: (f64, f64), end: (f64, f64), t: f64) -> (f64, f64) {
     )
 }
 
-fn route_segments(from: usize, to: usize) -> Vec<(usize, usize)> {
-    if from == ASTRA_PRIME || to == ASTRA_PRIME {
-        vec![(from, to)]
-    } else {
-        vec![(from, ASTRA_PRIME), (ASTRA_PRIME, to)]
+fn route_position(
+    app: &App,
+    segments: &[(usize, usize)],
+    segment_costs: &[u16],
+    eta_remaining: u16,
+    total_eta: u16,
+) -> Option<((usize, usize), (f64, f64))> {
+    if segments.is_empty() {
+        return None;
     }
+
+    if segments.len() == 1 {
+        let (start, end) = segments[0];
+        return Some((
+            (start, end),
+            interpolate(
+                app.map_coords(start),
+                app.map_coords(end),
+                transit_progress(eta_remaining, total_eta),
+            ),
+        ));
+    }
+
+    let total_cost: u16 = segment_costs.iter().copied().sum::<u16>().max(1);
+    let completed_progress = transit_progress(eta_remaining, total_eta);
+    let mut distance_along = completed_progress.clamp(0.05, 0.95) * f64::from(total_cost);
+
+    for (segment_index, &(start, end)) in segments.iter().enumerate() {
+        let segment_cost = f64::from(
+            segment_costs
+                .get(segment_index)
+                .copied()
+                .unwrap_or(1)
+                .max(1),
+        );
+        if distance_along <= segment_cost || segment_index == segments.len() - 1 {
+            let local_t = (distance_along / segment_cost).clamp(0.05, 0.95);
+            return Some((
+                (start, end),
+                interpolate(app.map_coords(start), app.map_coords(end), local_t),
+            ));
+        }
+        distance_along -= segment_cost;
+    }
+
+    let (start, end) = segments[segments.len() - 1];
+    Some((
+        (start, end),
+        interpolate(app.map_coords(start), app.map_coords(end), 0.95),
+    ))
 }
 
 fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        Line::from(format!(
+            "Map view: {} | {}",
+            app.map_zoom_label(),
+            app.map_scope_label()
+        )),
+        Line::from(format!("Focus: {}", app.map_focus_location_name())),
+        Line::from(format!(
+            "Selected destination: {}",
+            app.location_name(app.selected_location)
+        )),
+        Line::from(app.location_description(app.selected_location).to_string()),
+        Line::from("z: zoom in   x: zoom out   g: auto-focus on active ship"),
+        Line::from(""),
+    ];
+
+    let selected_ship = &app.fleet[app.selected_ship];
+    lines.push(Line::from(format!(
+        "Selected ship: {} ({})",
+        selected_ship.name, selected_ship.class_name
+    )));
+    lines.push(Line::from(format!(
+        "Player status: {}",
+        app.player_status_text()
+    )));
+    if let Some(intent) = app.pending_dispatch_intent() {
+        lines.push(Line::from(format!("Pending intent: {}", intent.label())));
+    }
+    if selected_ship.is_docked() {
+        if let Some(plan) = app.plan_route_for_ship(app.selected_ship, app.selected_location) {
+            lines.push(Line::from(format!(
+                "Selected ship preview to {}: ETA {} | fuel {} | path {}",
+                app.location_name(app.selected_location),
+                plan.eta,
+                plan.fuel_required,
+                plan.path
+            )));
+            if app.player_can_operate_ship(app.selected_ship) {
+                lines.push(Line::from("Local control: YES"));
+            } else {
+                lines.push(Line::from(format!(
+                    "Local control: NO - ship is at {}",
+                    app.location_name(selected_ship.current_location)
+                )));
+            }
+        } else {
+            lines.push(Line::from(
+                "Selected ship preview: unavailable for the current destination.",
+            ));
+        }
+    } else {
+        lines.push(Line::from(
+            "Selected ship preview: unavailable while this ship is in transit.",
+        ));
+    }
+    if let Some(_target) = app.locations[app.selected_location].reveal_on_arrival
+        && !app.is_discovered(_target)
+    {
+        let heading = app
+            .exploration_heading_hint(app.selected_location)
+            .unwrap_or_else(|| "into the unknown".to_string());
+        lines.push(Line::from(format!(
+            "Exploration lead: hidden contact {}.",
+            heading
+        )));
+    }
+    lines.push(Line::from(""));
 
     if let Some(ship_index) = app.pending_ship() {
         let ship = &app.fleet[ship_index];
         lines.push(Line::from(vec![
             Span::raw("Planning route for: "),
             Span::styled(
-                ship.name,
+                ship.name.clone(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -999,9 +1409,17 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
             ship.speed, ship.current_fuel, ship.max_fuel
         )));
         lines.push(Line::from(format!(
+            "Dockside traffic: {} ship(s) at {}",
+            docked_ship_count_at(app, ship.current_location),
+            app.location_name(ship.current_location)
+        )));
+        lines.push(Line::from(format!(
             "Destination: {}",
             app.location_name(app.selected_location)
         )));
+        if let Some(intent) = app.pending_dispatch_intent() {
+            lines.push(Line::from(format!("Intent: {}", intent.label())));
+        }
 
         if let Some(plan) = app.plan_route_for_ship(ship_index, app.selected_location) {
             lines.push(Line::from(format!("Path: {}", plan.path)));
@@ -1011,6 +1429,11 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
                 "Conditions: {}",
                 plan.condition_summary
             )));
+            if let Some(note) =
+                app.active_mission_assignment_note(ship_index, app.selected_location, plan.eta)
+            {
+                lines.push(Line::from(note));
+            }
             lines.extend(route_fuel_lines(app, ship_index, plan.fuel_required));
 
             if let Some(contract_index) = app.tracked_contract {
@@ -1041,8 +1464,28 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
             }
 
             if app.is_frontier_location(app.selected_location) {
+                let heading = app
+                    .exploration_heading_hint(app.selected_location)
+                    .unwrap_or_else(|| "into the unknown".to_string());
+                lines.push(Line::from(format!(
+                    "Exploration lead: hidden contact {}.",
+                    heading
+                )));
+            }
+            if matches!(
+                app.pending_dispatch_intent(),
+                Some(crate::game::DispatchIntent::Exploration)
+            ) && !app.is_frontier_location(app.selected_location)
+            {
                 lines.push(Line::from(
-                    "Survey lead: arrival may reveal new coordinates.",
+                    "Exploration requires a frontier node with an uncharted contact.",
+                ));
+            }
+            if app.sector_index_for_location(ship.current_location)
+                != app.sector_index_for_location(app.selected_location)
+            {
+                lines.push(Line::from(
+                    "Inter-sector route: jump corridor traversal required.",
                 ));
             }
         } else {
@@ -1051,7 +1494,9 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
             ));
         }
 
-        lines.push(Line::from("Enter: confirm route   Esc: cancel"));
+        lines.push(Line::from(
+            "Enter: confirm dispatch/exploration   Esc: cancel   z/x/g: navigate map view",
+        ));
         return lines;
     }
 
@@ -1059,7 +1504,7 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::raw("Selected ship: "),
         Span::styled(
-            ship.name,
+            ship.name.clone(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1076,6 +1521,11 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
                 "Ship stats: speed {} | fuel {}/{}",
                 ship.speed, ship.current_fuel, ship.max_fuel
             )));
+            lines.push(Line::from(format!(
+                "Dockside traffic: {} ship(s) at {}",
+                docked_ship_count_at(app, ship.current_location),
+                app.location_name(ship.current_location)
+            )));
 
             if let Some(plan) = app.plan_route_for_ship(app.selected_ship, app.selected_location) {
                 lines.push(Line::from(format!("Preview: {}", plan.path)));
@@ -1085,6 +1535,13 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
                     "Conditions: {}",
                     plan.condition_summary
                 )));
+                if let Some(note) = app.active_mission_assignment_note(
+                    app.selected_ship,
+                    app.selected_location,
+                    plan.eta,
+                ) {
+                    lines.push(Line::from(note));
+                }
                 lines.extend(route_fuel_lines(app, app.selected_ship, plan.fuel_required));
 
                 if let Some(contract_index) = app.tracked_contract {
@@ -1110,8 +1567,19 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
                 }
 
                 if app.is_frontier_location(app.selected_location) {
+                    let heading = app
+                        .exploration_heading_hint(app.selected_location)
+                        .unwrap_or_else(|| "into the unknown".to_string());
+                    lines.push(Line::from(format!(
+                        "Exploration lead: hidden contact {}.",
+                        heading
+                    )));
+                }
+                if app.sector_index_for_location(ship.current_location)
+                    != app.sector_index_for_location(app.selected_location)
+                {
                     lines.push(Line::from(
-                        "Survey lead: arrival may reveal new coordinates.",
+                        "Inter-sector route preview: this dispatch crosses a jump corridor.",
                     ));
                 }
             } else {
@@ -1119,6 +1587,9 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
                     "Select a different charted destination to preview a route.",
                 ));
             }
+
+            lines.push(Line::from(""));
+            lines.extend(shipyard_lines(app));
 
             lines.push(Line::from("Press Enter in Fleet to dispatch this ship."));
         }
@@ -1178,6 +1649,134 @@ fn route_preview_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn station_info_lines(app: &App) -> Vec<Line<'static>> {
+    let index = app.selected_location;
+    let mut lines = vec![
+        Line::from(format!("{}", app.location_name(index))),
+        Line::from(format!(
+            "Fuel reserves: {} | {} | {}",
+            app.station_fuel[index],
+            app.location_sector(index),
+            app.location_region(index)
+        )),
+        Line::from(if app.player_is_in_transit() {
+            format!("Player status: {}", app.player_status_text())
+        } else if index == app.player_location {
+            "You are here.".to_string()
+        } else {
+            match app.player_transfer_cost(index) {
+                Some(cost) => format!("Passenger transfer with `m`: {} cr", cost),
+                None => "Passenger transfer unavailable".to_string(),
+            }
+        }),
+    ];
+
+    if app.is_discovered(index) {
+        lines.push(Line::from(app.location_description(index).to_string()));
+    } else {
+        lines.push(Line::from(
+            "Uncharted location. Details unlock after discovery.",
+        ));
+    }
+
+    if app.has_shipyard(index) {
+        lines.push(Line::from(format!(
+            "Shipyard offers: {}",
+            app.shipyard_offer_count(index)
+        )));
+        if let Some(offer) = app.shipyard_offer(index) {
+            lines.push(Line::from(format!(
+                "Selected hull: {} ({}) for {} cr",
+                offer.name, offer.class_name, offer.price
+            )));
+            if app.credits >= offer.price {
+                lines.push(Line::from(
+                    "Purchase available now: press `b` or Enter in Shipyards.",
+                ));
+            } else {
+                lines.push(Line::from(format!(
+                    "Need {} more cr to buy this hull.",
+                    offer.price - app.credits
+                )));
+            }
+        } else {
+            lines.push(Line::from("Shipyard: sold out until next rotation"));
+        }
+    } else {
+        lines.push(Line::from("Shipyard: none active"));
+    }
+
+    if let Some(_target) = app.locations[index].reveal_on_arrival
+        && !app.is_discovered(_target)
+    {
+        let heading = app
+            .exploration_heading_hint(index)
+            .unwrap_or_else(|| "into the unknown".to_string());
+        lines.push(Line::from(format!(
+            "Exploration lead: hidden contact {}.",
+            heading
+        )));
+    }
+
+    lines.push(Line::from(format!(
+        "Docked ships here: {}",
+        docked_ship_count_at(app, index)
+    )));
+
+    lines
+}
+
+fn docked_ship_count_at(app: &App, location_index: usize) -> usize {
+    app.fleet
+        .iter()
+        .filter(|ship| {
+            ship.current_location == location_index
+                && matches!(&ship.state, ShipState::Docked | ShipState::Repairing { .. })
+        })
+        .count()
+}
+
+fn shipyard_list_items(app: &App) -> Vec<ListItem<'static>> {
+    let location_index = app.selected_location;
+    let offers = app.shipyard_offers(location_index);
+    if !app.has_shipyard(location_index) {
+        return vec![ListItem::new("No shipyard at the selected station.")];
+    }
+    if offers.is_empty() {
+        return vec![ListItem::new("Shipyard sold out until next rotation.")];
+    }
+
+    offers.iter().map(shipyard_offer_item).collect()
+}
+
+fn shipyard_offer_item(offer: &ShipShopOffer) -> ListItem<'static> {
+    ListItem::new(vec![
+        Line::from(format!("{} [{}]", offer.name, offer.class_name)),
+        Line::from(format!(
+            "{} cr | Speed {} | Fuel {}",
+            offer.price, offer.speed, offer.max_fuel
+        )),
+    ])
+}
+
+fn shipyard_marker_style(app: &App, index: usize) -> Style {
+    let color = if app.shipyard_offer_count(index) > 0 {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn player_marker_style(app: &App, index: usize) -> Style {
+    let color = if index == app.selected_location {
+        Color::Yellow
+    } else {
+        Color::LightGreen
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
 fn route_fuel_lines(app: &App, ship_index: usize, fuel_required: u16) -> Vec<Line<'static>> {
     let ship = &app.fleet[ship_index];
     let station_index = ship.current_location;
@@ -1219,6 +1818,23 @@ fn route_fuel_lines(app: &App, ship_index: usize, fuel_required: u16) -> Vec<Lin
                     units, cost
                 )));
             }
+            RefuelPlan::EmergencyReserve {
+                purchased_units,
+                reserve_units,
+                cost,
+            } => {
+                if purchased_units > 0 {
+                    lines.push(Line::from(format!(
+                        "Refuel with `f`: +{} paid fuel for {} cr, emergency reserve +{}",
+                        purchased_units, cost, reserve_units
+                    )));
+                } else {
+                    lines.push(Line::from(format!(
+                        "Refuel with `f`: emergency reserve +{} fuel in Cozy",
+                        reserve_units
+                    )));
+                }
+            }
             RefuelPlan::NeedTransfer { units } => {
                 lines.push(Line::from(format!(
                     "Need {} transferred fuel with `t` or more station stock",
@@ -1243,6 +1859,64 @@ fn route_fuel_lines(app: &App, ship_index: usize, fuel_required: u16) -> Vec<Lin
     lines
 }
 
+fn shipyard_lines(app: &App) -> Vec<Line<'static>> {
+    let location_index = app.selected_location;
+    let mut lines = vec![Line::from(format!(
+        "Selected station: {}",
+        app.location_name(location_index)
+    ))];
+
+    if !app.is_discovered(location_index) {
+        lines.push(Line::from(
+            "Shipyard intel unavailable until this station is charted.",
+        ));
+        return lines;
+    }
+
+    lines.push(Line::from(format!(
+        "Cluster: {} | System: {}",
+        app.location_cluster(location_index),
+        app.location_system(location_index)
+    )));
+    lines.push(Line::from(
+        app.location_description(location_index).to_string(),
+    ));
+
+    if !app.has_shipyard(location_index) {
+        lines.push(Line::from("Shipyard: none active at this station."));
+        return lines;
+    }
+
+    lines.push(Line::from(format!(
+        "Available hulls: {}",
+        app.shipyard_offer_count(location_index)
+    )));
+
+    match app.shipyard_offer(location_index) {
+        Some(offer) => {
+            lines.push(Line::from(format!(
+                "Selected hull: {} ({}) for {} cr",
+                offer.name, offer.class_name, offer.price
+            )));
+            lines.push(Line::from(format!(
+                "Offer stats: speed {} | fuel {}",
+                offer.speed, offer.max_fuel
+            )));
+            lines.push(Line::from(offer.description.clone()));
+            lines.push(Line::from(
+                "Press `b` in the map pane or Enter in Shipyards to acquire this hull.",
+            ));
+        }
+        None => {
+            lines.push(Line::from(
+                "Shipyard: featured hull sold out; wait for the next yard rotation.",
+            ));
+        }
+    }
+
+    lines
+}
+
 fn contract_list_summary(app: &App, index: usize) -> String {
     let contract = &app.contracts[index];
 
@@ -1253,8 +1927,8 @@ fn contract_list_summary(app: &App, index: usize) -> String {
             Difficulty::Insane => format!("Open | {}t window after accept", contract.deadline),
         },
         crate::game::ContractState::Accepted { .. } => app.contract_pressure_text(index),
-        crate::game::ContractState::Assigned { ship_name, .. } => {
-            format!("Assigned to {}", ship_name)
+        crate::game::ContractState::Assigned { ship_index, .. } => {
+            format!("Assigned to {}", app.fleet[ship_index].name)
         }
         crate::game::ContractState::Completed => "Completed; slot will refresh".to_string(),
         crate::game::ContractState::Failed => "Failed; slot will refresh".to_string(),
@@ -1295,8 +1969,15 @@ fn contract_detail_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(format!("Archetype: {}", contract.archetype.title())),
         Line::from(contract.archetype.effect_summary()),
         Line::from(app.contract_pressure_text(index)),
-        Line::from(contract.briefing.clone()),
     ];
+
+    if contract.pending_llm_flavor {
+        lines.push(Line::from(
+            "Flavor: background generation pending; deterministic fallback is shown until it finishes.",
+        ));
+    }
+
+    lines.push(Line::from(contract.briefing.clone()));
 
     if matches!(app.difficulty, Difficulty::Cozy) {
         if let Some((ship_index, eta)) = best_ship_hint(app, index) {
@@ -1328,8 +2009,17 @@ fn ship_detail_lines(app: &App) -> Vec<Line<'static>> {
     let ship = &app.fleet[ship_index];
     let station = app.location_name(ship.current_location);
     let mut lines = vec![
-        Line::from(ship.name),
+        Line::from(ship.name.clone()),
+        Line::from(format!("Class: {}", ship.class_name)),
         Line::from(format!("Station: {}", station)),
+        Line::from(if ship.current_location == app.player_location {
+            "Local control: available here".to_string()
+        } else {
+            format!(
+                "Remote ship: transfer to {} to issue new orders",
+                app.location_name(ship.current_location)
+            )
+        }),
         Line::from(format!(
             "Speed: {} | Fuel: {}/{}",
             ship.speed, ship.current_fuel, ship.max_fuel
@@ -1343,6 +2033,7 @@ fn ship_detail_lines(app: &App) -> Vec<Line<'static>> {
             "Station fuel stock: {}",
             app.station_fuel[ship.current_location]
         )),
+        Line::from(ship.description.clone()),
     ];
 
     if ship.current_fuel <= ship.max_fuel.saturating_div(4).max(1) {
@@ -1431,7 +2122,7 @@ fn ship_list_item(
     contracts: &[crate::game::Contract],
     pending: bool,
 ) -> ListItem<'static> {
-    let mut title = ship.name.to_string();
+    let mut title = format!("{} [{}]", ship.name, ship.class_name);
     if pending {
         title.push_str(" [planning]");
     }
@@ -1518,7 +2209,7 @@ fn best_ship_hint(app: &App, contract_index: usize) -> Option<(usize, u16)> {
         .iter()
         .enumerate()
         .filter(|(_, ship)| {
-            matches!(ship.state, ShipState::Docked) && ship.current_location == contract.origin
+            matches!(&ship.state, ShipState::Docked) && ship.current_location == contract.origin
         })
         .filter_map(|(ship_index, ship)| {
             app.plan_route_for_ship(ship_index, contract.destination)
