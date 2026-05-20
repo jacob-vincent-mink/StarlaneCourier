@@ -296,7 +296,7 @@ impl App {
             .map(|state| state.seed)
     }
 
-    fn sync_action_feedback_popup(&mut self) {
+    pub(crate) fn sync_action_feedback_popup(&mut self) {
         if let Some(message) = self.game.take_action_feedback() {
             self.popup_message = Some(message);
         }
@@ -562,7 +562,7 @@ impl App {
             })
     }
 
-    fn begin_new_game(&mut self) {
+    pub(crate) fn begin_new_game(&mut self) {
         self.active_save_slot = self.load_slot_selection;
         let world_seed = self.generate_world_seed();
         self.pending_world_initialization = None;
@@ -786,7 +786,7 @@ impl App {
         self.screen = Screen::StartMenu;
     }
 
-    fn regenerate_selected_contract_flavor(&mut self) {
+    pub(crate) fn regenerate_selected_contract_flavor(&mut self) {
         let index = self.selected_contract;
 
         if !self.llm_ready() {
@@ -880,7 +880,7 @@ impl App {
             .map_err(io::Error::other)
     }
 
-    fn snapshot(&self) -> SaveGame {
+    pub(crate) fn snapshot(&self) -> SaveGame {
         SaveGame {
             version: SAVE_VERSION,
             tick_speed_index: self.tick_speed_index,
@@ -1395,7 +1395,7 @@ impl App {
         ]
     }
 
-    fn sync_end_screen(&mut self) {
+    pub(crate) fn sync_end_screen(&mut self) {
         if self.run_outcome.is_some() {
             self.screen = Screen::EndGame;
         }
