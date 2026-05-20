@@ -67,35 +67,39 @@ const SHIP_BLUEPRINTS: [ShipBlueprint; 6] = [
     },
 ];
 
-pub(super) fn starting_fleet(world_flavor: Option<&WorldFlavor>) -> Vec<Ship> {
+pub(super) fn starting_fleet(world_seed: u64, world_flavor: Option<&WorldFlavor>) -> Vec<Ship> {
+    let locations = starting_fleet_locations(world_seed);
     vec![
         build_docked_ship(
             0,
             0,
-            ASTRA_PRIME,
+            locations[0],
             9,
             world_flavor.and_then(|f| f.starter_ships.first()),
         ),
-        build_en_route_ship(
+        build_docked_ship(
             1,
             1,
-            ASTRA_PRIME,
-            DUST_HARBOR,
-            7,
-            7,
-            "Astra Prime -> Dust Harbor",
-            "Dust Corridor: debris interference",
-            2,
+            locations[1],
+            12,
             world_flavor.and_then(|f| f.starter_ships.get(1)),
         ),
         build_docked_ship(
             2,
             2,
-            ASTRA_PRIME,
+            locations[2],
             13,
             world_flavor.and_then(|f| f.starter_ships.get(2)),
         ),
     ]
+}
+
+fn starting_fleet_locations(world_seed: u64) -> [usize; 3] {
+    if world_seed % 2 == 0 {
+        [ASTRA_PRIME, DUST_HARBOR, ASTRA_PRIME]
+    } else {
+        [ASTRA_PRIME, ASTRA_PRIME, DUST_HARBOR]
+    }
 }
 
 pub(super) fn starting_ship_shops(
@@ -139,44 +143,6 @@ fn build_docked_ship(
         current_fuel.min(blueprint.max_fuel),
         blueprint.max_fuel,
         blueprint.speed,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_en_route_ship(
-    seed: u64,
-    blueprint_index: usize,
-    origin: usize,
-    destination: usize,
-    eta_remaining: u16,
-    total_eta: u16,
-    route: &str,
-    condition_summary: &str,
-    current_fuel: u16,
-    generated: Option<&WorldShipFlavor>,
-) -> Ship {
-    let blueprint = &SHIP_BLUEPRINTS[blueprint_index % SHIP_BLUEPRINTS.len()];
-    let (name, class_name, description) = flavored_ship_text(seed, blueprint, generated);
-    let segments = vec![(origin, destination)];
-    let segment_costs = vec![total_eta.max(1)];
-    Ship::en_route(
-        name,
-        class_name,
-        description,
-        origin,
-        destination,
-        eta_remaining,
-        total_eta,
-        false,
-        segments,
-        segment_costs,
-        route,
-        condition_summary,
-        None,
-        current_fuel.min(blueprint.max_fuel),
-        blueprint.max_fuel,
-        blueprint.speed,
-        0,
     )
 }
 

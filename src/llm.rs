@@ -65,10 +65,7 @@ impl ContractFlavorGenerator for OpenAiCompatibleContractFlavorGenerator {
     fn test_connection(&self, settings: &LlmSettings, api_key: Option<&str>) -> Result<(), String> {
         let api_key = resolved_api_key(settings, api_key)?;
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(settings.timeout_secs.max(5)))
-            .build()
-            .map_err(|error| error.to_string())?;
+        let client = timed_client(settings.timeout_secs)?;
 
         let mut request = client.get(normalize_models_endpoint(&settings.endpoint_url));
         if let Some(api_key) = api_key {
@@ -103,10 +100,7 @@ impl ContractFlavorGenerator for OpenAiCompatibleContractFlavorGenerator {
             .map(|location| location.name.as_str())
             .unwrap_or("Unknown");
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(settings.timeout_secs.max(5)))
-            .build()
-            .map_err(|error| error.to_string())?;
+        let client = generation_client(settings.timeout_secs)?;
 
         let body = json!({
             "model": settings.model,
@@ -162,10 +156,7 @@ impl ContractFlavorGenerator for OpenAiCompatibleContractFlavorGenerator {
     ) -> Result<WorldFlavor, String> {
         let api_key = resolved_api_key(settings, api_key)?;
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(settings.timeout_secs.max(5)))
-            .build()
-            .map_err(|error| error.to_string())?;
+        let client = generation_client(settings.timeout_secs)?;
 
         let body = json!({
             "model": settings.model,
@@ -385,4 +376,18 @@ fn normalize_models_endpoint(endpoint: &str) -> String {
     } else {
         format!("{trimmed}/models")
     }
+}
+
+fn timed_client(timeout_secs: u64) -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(timeout_secs.max(5)))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn generation_client(timeout_secs: u64) -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(timeout_secs.max(5)))
+        .build()
+        .map_err(|error| error.to_string())
 }

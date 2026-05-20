@@ -86,6 +86,12 @@ pub(crate) struct SaveGame {
     #[serde(default)]
     pub(crate) sector_summary: String,
     #[serde(default)]
+    pub(crate) bootstrap_status: String,
+    #[serde(default)]
+    pub(crate) exploration_cursor: SavedMapPoint,
+    #[serde(default)]
+    pub(crate) exploration_traces: Vec<SavedExplorationTrace>,
+    #[serde(default)]
     pub(crate) locations: Vec<SavedLocation>,
     pub(crate) discovered_locations: Vec<bool>,
     #[serde(default)]
@@ -128,6 +134,12 @@ pub(crate) struct SavedLocation {
     pub(crate) system_coords: SavedMapPoint,
     pub(crate) travel_time_from_hub: u16,
     pub(crate) reveal_on_arrival: Option<usize>,
+    #[serde(default)]
+    pub(crate) exploration_attempts: u8,
+    #[serde(default)]
+    pub(crate) exploration_exhausted: bool,
+    #[serde(default)]
+    pub(crate) charted_empty: bool,
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -190,6 +202,14 @@ pub(crate) enum SavedShipState {
         #[serde(default)]
         exploration_run: bool,
         #[serde(default)]
+        exploration_target: Option<SavedMapPoint>,
+        #[serde(default)]
+        exploration_discoveries: Vec<usize>,
+        #[serde(default)]
+        exploration_revealed_count: usize,
+        #[serde(default)]
+        exploration_outcome: Option<SavedExplorationTraceOutcome>,
+        #[serde(default)]
         segments: Vec<(usize, usize)>,
         #[serde(default)]
         segment_costs: Vec<u16>,
@@ -199,6 +219,13 @@ pub(crate) enum SavedShipState {
         #[serde(default)]
         repair_on_arrival: u16,
     },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum SavedExplorationTraceOutcome {
+    Discovery,
+    Miss,
+    Empty,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -219,6 +246,13 @@ pub(crate) struct SavedShipOffer {
     pub(crate) speed: u16,
     pub(crate) max_fuel: u16,
     pub(crate) price: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SavedExplorationTrace {
+    pub(crate) origin: usize,
+    pub(crate) target: SavedMapPoint,
+    pub(crate) outcome: SavedExplorationTraceOutcome,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -322,6 +356,9 @@ impl LegacySaveGameV1 {
             world_seed: 0,
             sector_name: String::new(),
             sector_summary: String::new(),
+            bootstrap_status: String::new(),
+            exploration_cursor: SavedMapPoint::default(),
+            exploration_traces: Vec::new(),
             locations: Vec::new(),
             discovered_locations: self.discovered_locations,
             station_fuel: self.station_fuel,
@@ -537,6 +574,10 @@ mod tests {
                         eta_remaining: 7,
                         total_eta: 7,
                         exploration_run: false,
+                        exploration_target: None,
+                        exploration_discoveries: Vec::new(),
+                        exploration_revealed_count: 0,
+                        exploration_outcome: None,
                         segments: vec![(0, 3)],
                         segment_costs: vec![7],
                         route: "Astra Prime -> Dust Harbor".to_string(),

@@ -41,6 +41,8 @@ pub(crate) struct GameData {
     pub(crate) mode: AppMode,
     pub(crate) map_zoom: MapZoom,
     pub(crate) map_focus_location: usize,
+    pub(crate) exploration_cursor: MapPoint,
+    pub(crate) exploration_traces: Vec<ExplorationTrace>,
     pub(crate) player_location: usize,
     pub(crate) player_in_transit_ship: Option<usize>,
     pub(crate) selected_alert: usize,
@@ -76,7 +78,7 @@ impl GameData {
             generated_locations(world_seed, world_flavor_ref);
         let location_count = locations.len();
         let station_ship_shops = ships::starting_ship_shops(locations.len(), world_flavor_ref);
-        let fleet = ships::starting_fleet(world_flavor_ref);
+        let fleet = ships::starting_fleet(world_seed, world_flavor_ref);
         Self {
             difficulty,
             run_outcome: None,
@@ -88,6 +90,8 @@ impl GameData {
             mode: AppMode::Browse,
             map_zoom: MapZoom::Sector,
             map_focus_location: DUST_HARBOR,
+            exploration_cursor: MapPoint { x: 50, y: 30 },
+            exploration_traces: Vec::new(),
             player_location: ASTRA_PRIME,
             player_in_transit_ship: None,
             selected_alert: 0,
@@ -248,10 +252,16 @@ impl GameData {
         self.clock += 1;
         let mut arrivals = Vec::new();
         let mut travel_logs = Vec::new();
+        let mut exploration_reveals = Vec::new();
         let location_names: Vec<&str> = self
             .locations
             .iter()
             .map(|location| location.name.as_str())
+            .collect();
+        let sector_coords: Vec<MapPoint> = self
+            .locations
+            .iter()
+            .map(|location| location.sector_coords)
             .collect();
 
         for (ship_index, ship) in self.fleet.iter_mut().enumerate() {
@@ -273,17 +283,27 @@ impl GameData {
             }
 
             if let ShipState::EnRoute {
+                origin,
                 destination,
                 eta_remaining,
                 total_eta,
                 exploration_run,
+                exploration_target,
+                exploration_discoveries,
+                exploration_revealed_count,
+                exploration_outcome,
                 assigned_contract,
                 repair_on_arrival,
                 ..
             } = &mut ship.state
             {
+                let origin_index = *origin;
                 let destination_index = *destination;
                 let exploring = *exploration_run;
+                let survey_target = *exploration_target;
+                let survey_discoveries = exploration_discoveries.clone();
+                let revealed_count = *exploration_revealed_count;
+                let survey_outcome = *exploration_outcome;
                 let contract_assignment = *assigned_contract;
                 let mut event_happened = false;
 
@@ -340,6 +360,26 @@ impl GameData {
                     *eta_remaining -= 1;
                 }
 
+                if exploring && let Some(target) = survey_target {
+                    let reveal_count = exploration_reveal_count_for_progress(
+                        &sector_coords,
+                        origin_index,
+                        target,
+                        destination_index,
+                        &survey_discoveries,
+                        *eta_remaining,
+                        *total_eta,
+                    );
+                    if reveal_count > revealed_count {
+                        *exploration_revealed_count = reveal_count;
+                        let newly_revealed =
+                            survey_discoveries[revealed_count..reveal_count].to_vec();
+                        if !newly_revealed.is_empty() {
+                            exploration_reveals.push((ship.name.clone(), newly_revealed));
+                        }
+                    }
+                }
+
                 if *eta_remaining == 0 {
                     ship.current_location = destination_index;
                     let repair_ticks = *repair_on_arrival;
@@ -354,9 +394,13 @@ impl GameData {
                     arrivals.push((
                         ship_index,
                         ship.name.clone(),
+                        origin_index,
                         destination_index,
                         player_riding,
                         exploring,
+                        survey_target,
+                        survey_discoveries,
+                        survey_outcome,
                         contract_assignment,
                         repair_ticks,
                     ));
@@ -378,13 +422,34 @@ impl GameData {
             self.push_log(entry);
         }
 
+        for (ship_name, revealed) in exploration_reveals {
+            let discovered_names = revealed
+                .iter()
+                .map(|&index| self.location_name(index).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for index in revealed {
+                self.discovered_locations[index] = true;
+            }
+            self.push_log(format!(
+                "[{clock:04}] Scan return: {ship_name} confirms {discovered_names}.",
+                clock = self.clock,
+                ship_name = ship_name,
+                discovered_names = discovered_names,
+            ));
+        }
+
         let had_arrivals = !arrivals.is_empty();
         for (
             ship_index,
             ship_name,
+            origin_index,
             destination_index,
             player_riding,
             exploring,
+            survey_target,
+            survey_discoveries,
+            survey_outcome,
             contract_assignment,
             repair_ticks,
         ) in arrivals
@@ -426,8 +491,20 @@ impl GameData {
                 );
             }
 
-            if exploring && let Some(discovery) = self.reveal_from_arrival(destination_index) {
-                self.push_log(discovery);
+            if exploring {
+                if let Some(target) = survey_target {
+                    if let Some(outcome) = survey_outcome {
+                        self.resolve_exploration_arrival(
+                            origin_index,
+                            target,
+                            outcome,
+                            &survey_discoveries,
+                            &ship_name,
+                        );
+                    }
+                } else if let Some(discovery) = self.reveal_from_arrival(destination_index) {
+                    self.push_log(discovery);
+                }
             }
         }
 
@@ -714,6 +791,9 @@ fn generated_locations(
                 },
                 travel_time_from_hub: [0, 4, 5, 6, 7][role_index],
                 reveal_on_arrival,
+                exploration_attempts: 0,
+                exploration_exhausted: false,
+                charted_empty: false,
             }
         })
         .collect();
@@ -1085,6 +1165,69 @@ fn travel_event_at(
     }
 }
 
+fn exploration_reveal_count_for_progress(
+    sector_coords: &[MapPoint],
+    origin: usize,
+    target: MapPoint,
+    destination: usize,
+    discoveries: &[usize],
+    eta_remaining: u16,
+    total_eta: u16,
+) -> usize {
+    let origin_point = sector_coords[origin].as_tuple();
+    let target_point = target.as_tuple();
+    let destination_point = sector_coords[destination].as_tuple();
+    let outbound_length = map_distance(origin_point, target_point);
+    if outbound_length < 1.0 {
+        return 0;
+    }
+
+    let total_length = outbound_length + map_distance(target_point, destination_point);
+    let completed_distance = exploration_progress_fraction(eta_remaining, total_eta) * total_length;
+    let outbound_progress = completed_distance.min(outbound_length);
+
+    discoveries
+        .iter()
+        .take_while(|&&index| {
+            projected_distance_on_ray(sector_coords[origin], target, sector_coords[index])
+                .is_some_and(|projected| projected <= outbound_progress + 0.5)
+        })
+        .count()
+}
+
+fn exploration_progress_fraction(eta_remaining: u16, total_eta: u16) -> f64 {
+    let completed = total_eta.saturating_sub(eta_remaining);
+    (f64::from(completed) / f64::from(total_eta.max(1))).clamp(0.05, 0.95)
+}
+
+fn projected_distance_on_ray(origin: MapPoint, target: MapPoint, point: MapPoint) -> Option<f64> {
+    let origin_point = origin.as_tuple();
+    let target_point = target.as_tuple();
+    let point_coords = point.as_tuple();
+    let ray = (
+        target_point.0 - origin_point.0,
+        target_point.1 - origin_point.1,
+    );
+    let ray_length = map_distance(origin_point, target_point);
+    if ray_length < 1.0 {
+        return None;
+    }
+
+    let ray_unit = (ray.0 / ray_length, ray.1 / ray_length);
+    let relative = (
+        point_coords.0 - origin_point.0,
+        point_coords.1 - origin_point.1,
+    );
+    let projected_distance = relative.0 * ray_unit.0 + relative.1 * ray_unit.1;
+    (projected_distance >= 0.0 && projected_distance <= ray_length).then_some(projected_distance)
+}
+
+fn map_distance(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,6 +1241,10 @@ mod tests {
             eta_remaining: 1,
             total_eta: 1,
             exploration_run: false,
+            exploration_target: None,
+            exploration_discoveries: Vec::new(),
+            exploration_revealed_count: 0,
+            exploration_outcome: None,
             segments: vec![(ASTRA_PRIME, DUST_HARBOR)],
             segment_costs: vec![1],
             route: "Astra Prime -> Dust Harbor".to_string(),
@@ -1116,6 +1263,10 @@ mod tests {
             eta_remaining: 1,
             total_eta: 1,
             exploration_run: true,
+            exploration_target: None,
+            exploration_discoveries: Vec::new(),
+            exploration_revealed_count: 0,
+            exploration_outcome: None,
             segments: vec![(ASTRA_PRIME, DUST_HARBOR)],
             segment_costs: vec![1],
             route: "Astra Prime -> Dust Harbor".to_string(),

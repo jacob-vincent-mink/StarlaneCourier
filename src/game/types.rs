@@ -73,6 +73,22 @@ impl Difficulty {
             Self::Insane => 6,
         }
     }
+
+    pub(crate) fn exploration_discovery_width(self) -> f64 {
+        match self {
+            Self::Cozy => 8.0,
+            Self::Normal => 6.0,
+            Self::Insane => 4.0,
+        }
+    }
+
+    pub(crate) fn exploration_glancing_width(self) -> f64 {
+        match self {
+            Self::Cozy => 15.0,
+            Self::Normal => 11.0,
+            Self::Insane => 8.0,
+        }
+    }
 }
 
 pub(crate) fn default_difficulty() -> Difficulty {
@@ -315,6 +331,20 @@ impl MapPoint {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplorationTraceOutcome {
+    Discovery,
+    Miss,
+    Empty,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExplorationTrace {
+    pub(crate) origin: usize,
+    pub(crate) target: MapPoint,
+    pub(crate) outcome: ExplorationTraceOutcome,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MapZoom {
     Region,
@@ -368,6 +398,9 @@ pub(crate) struct Location {
     pub(crate) system_coords: MapPoint,
     pub(crate) travel_time_from_hub: u16,
     pub(crate) reveal_on_arrival: Option<usize>,
+    pub(crate) exploration_attempts: u8,
+    pub(crate) exploration_exhausted: bool,
+    pub(crate) charted_empty: bool,
 }
 
 #[derive(Clone)]
@@ -382,6 +415,10 @@ pub(crate) enum ShipState {
         eta_remaining: u16,
         total_eta: u16,
         exploration_run: bool,
+        exploration_target: Option<MapPoint>,
+        exploration_discoveries: Vec<usize>,
+        exploration_revealed_count: usize,
+        exploration_outcome: Option<ExplorationTraceOutcome>,
         segments: Vec<(usize, usize)>,
         segment_costs: Vec<u16>,
         route: String,
@@ -426,52 +463,6 @@ impl Ship {
             hull: 100,
             low_fuel_alerted: false,
             state: ShipState::Docked,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn en_route(
-        name: impl Into<String>,
-        class_name: impl Into<String>,
-        description: impl Into<String>,
-        origin: usize,
-        destination: usize,
-        eta_remaining: u16,
-        total_eta: u16,
-        exploration_run: bool,
-        segments: Vec<(usize, usize)>,
-        segment_costs: Vec<u16>,
-        route: impl Into<String>,
-        condition_summary: impl Into<String>,
-        assigned_contract: Option<usize>,
-        current_fuel: u16,
-        max_fuel: u16,
-        speed: u16,
-        repair_on_arrival: u16,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            class_name: class_name.into(),
-            description: description.into(),
-            current_location: origin,
-            current_fuel,
-            max_fuel,
-            speed,
-            hull: 100,
-            low_fuel_alerted: false,
-            state: ShipState::EnRoute {
-                origin,
-                destination,
-                eta_remaining,
-                total_eta,
-                exploration_run,
-                segments,
-                segment_costs,
-                route: route.into(),
-                condition_summary: condition_summary.into(),
-                assigned_contract,
-                repair_on_arrival,
-            },
         }
     }
 

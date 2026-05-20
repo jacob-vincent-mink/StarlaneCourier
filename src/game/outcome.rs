@@ -5,7 +5,12 @@ impl GameData {
         (0..self.locations.len()).find_map(|index| {
             self.locations[index]
                 .reveal_on_arrival
-                .filter(|&target| self.is_discovered(index) && !self.is_discovered(target))
+                .filter(|&target| {
+                    self.is_discovered(index)
+                        && !self.locations[index].exploration_exhausted
+                        && !self.is_charted_empty(target)
+                        && !self.is_discovered(target)
+                })
                 .map(|target| (index, target))
         })
     }
@@ -14,7 +19,11 @@ impl GameData {
         self.is_discovered(index)
             && self.locations[index]
                 .reveal_on_arrival
-                .is_some_and(|target| !self.is_discovered(target))
+                .is_some_and(|target| {
+                    !self.locations[index].exploration_exhausted
+                        && !self.is_charted_empty(target)
+                        && !self.is_discovered(target)
+                })
     }
 
     pub(crate) fn frontier_locations(&self) -> Vec<usize> {
@@ -38,18 +47,71 @@ impl GameData {
     pub(crate) fn reveal_from_arrival(&mut self, location_index: usize) -> Option<String> {
         let target = self.locations[location_index].reveal_on_arrival?;
 
-        if self.is_discovered(target) {
+        if self.is_discovered(target)
+            || self.is_charted_empty(target)
+            || self.locations[location_index].exploration_exhausted
+        {
             return None;
         }
 
-        self.discovered_locations[target] = true;
+        let attempt = self.locations[location_index].exploration_attempts;
+        self.locations[location_index].exploration_attempts = attempt.saturating_add(1);
+        let heading = self
+            .exploration_heading_hint(location_index)
+            .unwrap_or_else(|| "into the uncharted reach".to_string());
 
-        Some(format!(
-            "[{clock:04}] Survey traffic from {origin} charted a new destination: {destination}.",
-            clock = self.clock,
-            origin = self.location_name(location_index),
-            destination = self.location_name(target),
-        ))
+        match self.exploration_survey_outcome(location_index, target, attempt) {
+            ExplorationSurveyOutcome::Discovery => {
+                self.discovered_locations[target] = true;
+                Some(format!(
+                    "[{clock:04}] Exploration sweep from {origin} charted a new destination {heading}: {destination}.",
+                    clock = self.clock,
+                    origin = self.location_name(location_index),
+                    heading = heading,
+                    destination = self.location_name(target),
+                ))
+            }
+            ExplorationSurveyOutcome::Miss => Some(format!(
+                "[{clock:04}] Exploration sweep from {origin} searched {heading} but found no chartable contact yet.",
+                clock = self.clock,
+                origin = self.location_name(location_index),
+                heading = heading,
+            )),
+            ExplorationSurveyOutcome::Exhausted => {
+                self.locations[location_index].exploration_exhausted = true;
+                Some(format!(
+                    "[{clock:04}] Exploration sweep from {origin} mapped {heading} and found only empty space. No further leads remain there.",
+                    clock = self.clock,
+                    origin = self.location_name(location_index),
+                    heading = heading,
+                ))
+            }
+        }
+    }
+
+    fn exploration_survey_outcome(
+        &self,
+        location_index: usize,
+        target: usize,
+        attempt: u8,
+    ) -> ExplorationSurveyOutcome {
+        match (target + self.sector_index_for_location(location_index)) % 4 {
+            0 | 1 => ExplorationSurveyOutcome::Discovery,
+            2 => {
+                if attempt == 0 {
+                    ExplorationSurveyOutcome::Miss
+                } else {
+                    ExplorationSurveyOutcome::Discovery
+                }
+            }
+            _ => {
+                if attempt == 0 {
+                    ExplorationSurveyOutcome::Miss
+                } else {
+                    ExplorationSurveyOutcome::Exhausted
+                }
+            }
+        }
     }
 
     pub(crate) fn in_transit_count(&self) -> usize {
@@ -160,6 +222,12 @@ impl GameData {
     }
 }
 
+enum ExplorationSurveyOutcome {
+    Discovery,
+    Miss,
+    Exhausted,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +244,40 @@ mod tests {
         }
 
         assert!(!game.has_viable_progress_path());
+    }
+
+    #[test]
+    fn exploration_sweep_can_miss_before_discovery() {
+        let mut game = GameData::new(Difficulty::Normal);
+        game.discovered_locations[KITE_STATION] = true;
+        game.discovered_locations[ION_ANCHORAGE] = false;
+
+        let first = game.reveal_from_arrival(KITE_STATION).unwrap();
+        assert!(first.contains("found no chartable contact yet"));
+        assert!(!game.discovered_locations[ION_ANCHORAGE]);
+        assert_eq!(game.locations[KITE_STATION].exploration_attempts, 1);
+
+        let second = game.reveal_from_arrival(KITE_STATION).unwrap();
+        assert!(second.contains(game.location_name(ION_ANCHORAGE)));
+        assert!(game.discovered_locations[ION_ANCHORAGE]);
+    }
+
+    #[test]
+    fn exploration_sweep_can_mark_a_reach_empty() {
+        let mut game = GameData::new(Difficulty::Normal);
+        game.locations[ASTRA_PRIME].reveal_on_arrival = Some(DUST_HARBOR);
+        game.locations[ASTRA_PRIME].exploration_attempts = 0;
+        game.locations[ASTRA_PRIME].exploration_exhausted = false;
+        game.discovered_locations[DUST_HARBOR] = false;
+
+        let first = game.reveal_from_arrival(ASTRA_PRIME).unwrap();
+        assert!(first.contains("found no chartable contact yet"));
+        assert!(game.is_frontier_location(ASTRA_PRIME));
+
+        let second = game.reveal_from_arrival(ASTRA_PRIME).unwrap();
+        assert!(second.contains("found only empty space"));
+        assert!(game.locations[ASTRA_PRIME].exploration_exhausted);
+        assert!(!game.discovered_locations[DUST_HARBOR]);
+        assert!(!game.is_frontier_location(ASTRA_PRIME));
     }
 }

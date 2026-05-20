@@ -13,8 +13,8 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::game::{
-    ASTRA_PRIME, AppMode, Contract, ContractArchetype, Difficulty, GameData, Location, PANE_COUNT,
-    Ship, ShipShop, ShipShopOffer, ShipState, WorldFlavor,
+    ASTRA_PRIME, AppMode, Contract, ContractArchetype, Difficulty, DispatchIntent, GameData,
+    Location, PANE_COUNT, Ship, ShipShop, ShipShopOffer, ShipState, WorldFlavor,
 };
 use crate::llm::{
     ContractFlavorGenerator, GeneratedContractFlavor, OpenAiCompatibleContractFlavorGenerator,
@@ -31,6 +31,7 @@ use crate::settings::{
 pub(crate) const TICK_SPEEDS: [(&str, u64); 3] = [("Slow", 450), ("Standard", 250), ("Fast", 125)];
 pub(crate) const DIFFICULTY_OPTIONS: [Difficulty; 3] =
     [Difficulty::Cozy, Difficulty::Normal, Difficulty::Insane];
+const WORLD_BOOTSTRAP_MAX_ATTEMPTS: usize = 40;
 
 pub(crate) struct App {
     pub(crate) screen: Screen,
@@ -38,6 +39,7 @@ pub(crate) struct App {
     pub(crate) has_active_game: bool,
     pub(crate) menu_feedback: Option<String>,
     pub(crate) popup_message: Option<String>,
+    pub(crate) action_overlay: Option<ActionOverlay>,
     pub(crate) inspect_overlay: Option<InspectOverlay>,
     pub(crate) llm_gate_selection: usize,
     pub(crate) start_menu_selection: usize,
@@ -55,14 +57,15 @@ pub(crate) struct App {
     flavor_generator: Arc<dyn ContractFlavorGenerator>,
     llm_result_sender: Sender<ContractFlavorJobResult>,
     llm_result_receiver: Receiver<ContractFlavorJobResult>,
-    world_result_sender: Sender<WorldInitializationJobResult>,
-    world_result_receiver: Receiver<WorldInitializationJobResult>,
+    world_result_sender: Sender<WorldInitializationMessage>,
+    world_result_receiver: Receiver<WorldInitializationMessage>,
     in_flight_contract_flavors: BTreeSet<usize>,
     pending_world_initialization: Option<WorldInitializationState>,
     pub(crate) llm_settings: LlmSettings,
     pub(crate) api_key_present: bool,
     session_api_key: Option<String>,
     pub(crate) last_llm_status: String,
+    pub(crate) bootstrap_status: String,
     pub(crate) game: GameData,
 }
 
@@ -78,6 +81,54 @@ impl DerefMut for App {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.game
     }
+}
+
+fn world_bootstrap_retry_delay(attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis((attempt.max(1) as u64) * 10)
+    }
+
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(3)
+    }
+}
+
+fn generate_sector_with_retries(
+    flavor_generator: &dyn ContractFlavorGenerator,
+    settings: &LlmSettings,
+    api_key: Option<&str>,
+    world_seed: u64,
+    mut on_progress: impl FnMut(String),
+) -> Result<WorldFlavor, String> {
+    let mut last_error = None;
+
+    for attempt in 1..=WORLD_BOOTSTRAP_MAX_ATTEMPTS {
+        on_progress(format!(
+            "LLM sector bootstrap attempt {attempt}/{WORLD_BOOTSTRAP_MAX_ATTEMPTS}..."
+        ));
+        match flavor_generator.generate_sector(settings, api_key, world_seed) {
+            Ok(world) => return Ok(world),
+            Err(error) => {
+                let delay = world_bootstrap_retry_delay(attempt);
+                on_progress(format!(
+                    "LLM sector bootstrap attempt {attempt}/{WORLD_BOOTSTRAP_MAX_ATTEMPTS} failed: {error}. Retrying in {}s...",
+                    delay.as_secs_f32().ceil() as u64
+                ));
+                last_error = Some(error);
+                if attempt < WORLD_BOOTSTRAP_MAX_ATTEMPTS {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "{} (after {} attempts)",
+        last_error.unwrap_or_else(|| "unknown bootstrap error".to_string()),
+        WORLD_BOOTSTRAP_MAX_ATTEMPTS
+    ))
 }
 
 impl App {
@@ -97,7 +148,11 @@ impl App {
             settings,
             api_key_present,
         );
-        app.evaluate_startup_llm_gate();
+        if app.llm_settings.enabled {
+            app.last_llm_status =
+                "LLM startup check deferred; New Game bootstrap will retry in background."
+                    .to_string();
+        }
         app
     }
 
@@ -133,6 +188,7 @@ impl App {
             has_active_game: false,
             menu_feedback: None,
             popup_message: None,
+            action_overlay: None,
             inspect_overlay: None,
             llm_gate_selection: 0,
             start_menu_selection: 0,
@@ -158,6 +214,7 @@ impl App {
             api_key_present,
             session_api_key: None,
             last_llm_status: "LLM not tested yet.".to_string(),
+            bootstrap_status: String::new(),
             game,
         }
     }
@@ -175,23 +232,50 @@ impl App {
     }
 
     pub(crate) fn controls_text(&self) -> String {
+        if let Some(overlay) = &self.action_overlay {
+            return match overlay {
+                ActionOverlay::ShipPicker(_) => {
+                    "Up/Down: choose ship   Enter: confirm   Esc: cancel   q/Ctrl+C: quit"
+                        .to_string()
+                }
+                ActionOverlay::ShipActions(_) => {
+                    "Up/Down: choose action   Enter: confirm   Esc: cancel   q/Ctrl+C: quit"
+                        .to_string()
+                }
+                ActionOverlay::StationActions(_) => {
+                    "Up/Down: choose action   Enter: confirm   Esc: cancel   q/Ctrl+C: quit"
+                        .to_string()
+                }
+            };
+        }
+
         if self.inspect_overlay.is_some() {
             return "Tab/Shift+Tab or Left/Right: switch focus   Up/Down: select   i/Esc: close detail   Enter: primary action   e/f/t/u/m/b/r/z/x/g: context actions   s: settings   q/Ctrl+C: quit"
                 .to_string();
         }
 
         match self.mode {
-            AppMode::Browse => "Tab/Shift+Tab or Left/Right: focus   Up/Down: select   i: inspect focused panel   Enter: primary action   e: exploration run   m: move player   z/x: map zoom   g: map auto-focus   b: buy selected shipyard hull   f: refuel   t: transfer fuel   u: upgrade ship   r: regenerate flavor   s: settings   Esc: menu   q/Ctrl+C: quit"
+            AppMode::Browse => "Tab/Shift+Tab or Left/Right: focus   Up/Down: select   i: inspect focused panel   Enter: primary action   Del: release tracked mission   e: exploration run   m: transfer flight   z/x: map zoom   g: map auto-focus   b: buy selected shipyard hull   f: refuel   t: transfer fuel   u: upgrade ship   r: regenerate flavor   s: settings   Esc: menu   q/Ctrl+C: quit"
                 .to_string(),
-            AppMode::SelectingDestination { intent, .. } => format!(
-                "Up/Down: choose destination   z/x: map zoom   g: focus ship   i: inspect route detail   Enter: confirm {}   Esc: cancel   q/Ctrl+C: quit",
-                intent.label().to_lowercase()
-            ),
+            AppMode::SelectingDestination { intent, .. } => match intent {
+                DispatchIntent::Standard => format!(
+                    "Up/Down: choose destination   z/x: map zoom   g: focus ship   i: inspect route detail   Enter: confirm {}   Esc: cancel   q/Ctrl+C: quit",
+                    intent.label().to_lowercase()
+                ),
+                DispatchIntent::Exploration => {
+                    "Arrow keys: aim exploration ray   g: reset ray   z/x: keep full sector chart   i: inspect route detail   Enter: launch exploration sweep   Esc: cancel   q/Ctrl+C: quit"
+                        .to_string()
+                }
+            },
         }
     }
 
     pub(crate) fn current_inspect_overlay(&self) -> Option<InspectOverlay> {
         self.inspect_overlay
+    }
+
+    pub(crate) fn current_action_overlay(&self) -> Option<&ActionOverlay> {
+        self.action_overlay.as_ref()
     }
 
     fn inspect_overlay_for_active_pane(&self) -> InspectOverlay {
@@ -215,6 +299,309 @@ impl App {
             Some(_) => None,
             None => Some(self.inspect_overlay_for_active_pane()),
         };
+    }
+
+    fn local_docked_ship_indices(&self) -> Vec<usize> {
+        self.fleet
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ship)| {
+                (ship.current_location == self.player_location
+                    && matches!(&ship.state, ShipState::Docked))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn ships_that_can_transfer_player_to(&self, destination: usize) -> Vec<usize> {
+        self.local_docked_ship_indices()
+            .into_iter()
+            .filter(|&ship_index| {
+                self.plan_route_for_ship(ship_index, destination)
+                    .is_some_and(|plan| self.fleet[ship_index].current_fuel >= plan.fuel_required)
+            })
+            .collect()
+    }
+
+    fn open_ship_picker_overlay(&mut self, mode: ShipPickerMode, ship_indices: Vec<usize>) {
+        self.inspect_overlay = None;
+        self.action_overlay = Some(ActionOverlay::ShipPicker(ShipPickerOverlay {
+            mode,
+            ship_indices,
+            selection: 0,
+        }));
+    }
+
+    fn open_ship_actions_overlay(&mut self) {
+        if self.player_is_in_transit() {
+            self.set_action_feedback("You are already in transit aboard a ship.");
+            return;
+        }
+
+        let ship_index = self.selected_ship;
+        let ship_name = self.fleet[ship_index].name.clone();
+        let ship_location = self.fleet[ship_index].current_location;
+        let ship_is_docked = matches!(&self.fleet[ship_index].state, ShipState::Docked);
+
+        if !ship_is_docked {
+            self.set_action_feedback(format!(
+                "{} is not docked and is available for inspection only right now.",
+                ship_name
+            ));
+            return;
+        }
+
+        if ship_location != self.player_location {
+            let ship_location_name = self.location_name(ship_location).to_string();
+            self.set_action_feedback(format!(
+                "Transfer to {} before issuing direct orders to {}.",
+                ship_location_name, ship_name
+            ));
+            return;
+        }
+
+        self.inspect_overlay = None;
+        self.action_overlay = Some(ActionOverlay::ShipActions(ShipActionsOverlay {
+            ship_index,
+            options: vec![
+                ShipActionOption::Dispatch,
+                ShipActionOption::Explore,
+                ShipActionOption::Refuel,
+                ShipActionOption::TransferFuel,
+                ShipActionOption::Upgrade,
+            ],
+            selection: 0,
+        }));
+    }
+
+    fn open_station_actions_overlay(&mut self) {
+        let destination = self.selected_location;
+        let mut options = vec![StationActionOption::DispatchSelectedShip];
+        if !self.hidden_chartable_locations().is_empty() {
+            options.push(StationActionOption::ExploreHere);
+        }
+        if destination != self.player_location {
+            options.push(StationActionOption::TransferFlight);
+        }
+        if self.has_shipyard(destination) {
+            options.push(StationActionOption::BuySelectedHull);
+        }
+
+        self.inspect_overlay = None;
+        self.action_overlay = Some(ActionOverlay::StationActions(StationActionsOverlay {
+            destination,
+            options,
+            selection: 0,
+        }));
+    }
+
+    fn begin_route_selection_to_selected_location(&mut self, intent: DispatchIntent) {
+        let destination = self.selected_location;
+        match intent {
+            DispatchIntent::Standard => self.begin_dispatch(),
+            DispatchIntent::Exploration => self.begin_exploration(),
+        }
+
+        if matches!(self.mode, AppMode::SelectingDestination { .. }) {
+            self.selected_location = destination;
+            self.sync_map_focus_to_selected_location();
+        }
+    }
+
+    fn open_player_transfer_overlay(&mut self) {
+        if self.player_is_in_transit() {
+            self.set_action_feedback("You are already in transit aboard a ship.");
+            return;
+        }
+
+        let destination = self.selected_location;
+        if destination == self.player_location {
+            self.set_action_feedback("You are already at the selected station.");
+            return;
+        }
+
+        let candidates = self.ships_that_can_transfer_player_to(destination);
+        if candidates.is_empty() {
+            let local_ships = self.local_docked_ship_indices().len();
+            let destination_name = self.location_name(destination).to_string();
+            self.set_action_feedback(if local_ships == 0 {
+                "No docked local ship is available to take you there.".to_string()
+            } else {
+                format!(
+                    "No local docked ship can currently reach {}. Refuel one first.",
+                    destination_name
+                )
+            });
+            return;
+        }
+
+        if candidates.len() == 1 {
+            self.transfer_player_with_ship(candidates[0], destination);
+            return;
+        }
+
+        let selected_ship = self.selected_ship;
+        if candidates.contains(&selected_ship) {
+            self.transfer_player_with_ship(selected_ship, destination);
+            return;
+        }
+
+        self.open_ship_picker_overlay(ShipPickerMode::PlayerTransfer { destination }, candidates);
+    }
+
+    fn open_contract_ship_overlay(&mut self) {
+        let contract_index = self.selected_contract;
+        match self.contracts[contract_index].state {
+            crate::game::ContractState::Available => {
+                self.toggle_contract_tracking();
+                if !matches!(
+                    self.contracts[contract_index].state,
+                    crate::game::ContractState::Accepted { .. }
+                ) {
+                    return;
+                }
+            }
+            crate::game::ContractState::Accepted { .. } => {}
+            _ => {
+                self.toggle_contract_tracking();
+                return;
+            }
+        }
+
+        self.active_pane = crate::game::CONTRACTS_PANE;
+
+        let contract_origin = self.contracts[contract_index].origin;
+        if contract_origin != self.player_location {
+            let origin_name = self.location_name(contract_origin).to_string();
+            self.set_action_feedback(format!(
+                "Transfer to {} before choosing a ship for this mission.",
+                origin_name
+            ));
+            return;
+        }
+
+        let ship_indices = self.local_docked_ship_indices();
+        if ship_indices.is_empty() {
+            let player_location_name = self.location_name(self.player_location).to_string();
+            self.set_action_feedback(format!(
+                "No docked local ship is available at {} for this mission.",
+                player_location_name
+            ));
+            return;
+        }
+
+        self.open_ship_picker_overlay(
+            ShipPickerMode::ContractDispatch { contract_index },
+            ship_indices,
+        );
+    }
+
+    fn move_action_overlay_selection(&mut self, delta: isize) {
+        match self.action_overlay.as_mut() {
+            Some(ActionOverlay::ShipPicker(overlay)) => {
+                overlay.selection =
+                    crate::game::wrap_index(overlay.selection, overlay.ship_indices.len(), delta);
+            }
+            Some(ActionOverlay::ShipActions(overlay)) => {
+                overlay.selection =
+                    crate::game::wrap_index(overlay.selection, overlay.options.len(), delta);
+            }
+            Some(ActionOverlay::StationActions(overlay)) => {
+                overlay.selection =
+                    crate::game::wrap_index(overlay.selection, overlay.options.len(), delta);
+            }
+            None => {}
+        }
+    }
+
+    fn confirm_action_overlay(&mut self) {
+        let Some(overlay) = self.action_overlay.clone() else {
+            return;
+        };
+        self.action_overlay = None;
+
+        match overlay {
+            ActionOverlay::ShipPicker(overlay) => {
+                let Some(&ship_index) = overlay.ship_indices.get(overlay.selection) else {
+                    return;
+                };
+
+                self.selected_ship = ship_index;
+                match overlay.mode {
+                    ShipPickerMode::PlayerTransfer { destination } => {
+                        self.transfer_player_with_ship(ship_index, destination);
+                    }
+                    ShipPickerMode::ContractDispatch { .. } => {
+                        self.begin_dispatch();
+                    }
+                }
+            }
+            ActionOverlay::ShipActions(overlay) => {
+                let Some(&option) = overlay.options.get(overlay.selection) else {
+                    return;
+                };
+
+                self.selected_ship = overlay.ship_index;
+                match option {
+                    ShipActionOption::Dispatch => self.begin_dispatch(),
+                    ShipActionOption::Explore => self.begin_exploration(),
+                    ShipActionOption::Refuel => self.refuel_selected_ship(),
+                    ShipActionOption::TransferFuel => self.transfer_fuel_to_selected_ship(),
+                    ShipActionOption::Upgrade => self.upgrade_selected_ship(),
+                }
+            }
+            ActionOverlay::StationActions(overlay) => {
+                let Some(&option) = overlay.options.get(overlay.selection) else {
+                    return;
+                };
+
+                self.selected_location = overlay.destination;
+                self.sync_map_focus_to_selected_location();
+                match option {
+                    StationActionOption::DispatchSelectedShip => {
+                        self.begin_route_selection_to_selected_location(DispatchIntent::Standard)
+                    }
+                    StationActionOption::ExploreHere => {
+                        self.begin_route_selection_to_selected_location(DispatchIntent::Exploration)
+                    }
+                    StationActionOption::TransferFlight => self.open_player_transfer_overlay(),
+                    StationActionOption::BuySelectedHull => {
+                        self.purchase_ship_at_selected_location()
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_action_overlay_key(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => true,
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => true,
+            (KeyCode::Esc, _) => {
+                self.action_overlay = None;
+                false
+            }
+            (KeyCode::Up, _) => {
+                self.move_action_overlay_selection(-1);
+                false
+            }
+            (KeyCode::Down, _) => {
+                self.move_action_overlay_selection(1);
+                false
+            }
+            (KeyCode::Enter, _) => {
+                self.confirm_action_overlay();
+                self.sync_action_feedback_popup();
+                self.sync_end_screen();
+                let _ = self.save_game();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_contract_primary_action(&mut self) {
+        self.open_contract_ship_overlay();
     }
 
     pub(crate) fn poll_duration(&self) -> Duration {
@@ -357,7 +744,7 @@ impl App {
                     .to_string()
             }
             LlmField::TimeoutSecs => {
-                "Background request timeout in seconds for contract flavor generation."
+                "Connection timeout in seconds for LLM checks and establishing generation requests. Once connected, generation responses are allowed to complete."
                     .to_string()
             }
         }
@@ -566,6 +953,7 @@ impl App {
         self.active_save_slot = self.load_slot_selection;
         let world_seed = self.generate_world_seed();
         self.pending_world_initialization = None;
+        self.action_overlay = None;
         self.inspect_overlay = None;
 
         if self.llm_ready() {
@@ -590,18 +978,45 @@ impl App {
                 }
                 Err(error) => {
                     self.menu_feedback = Some(format!("LLM sector bootstrap unavailable: {error}"));
+                    self.complete_new_game(
+                        world_seed,
+                        None,
+                        format!(
+                            "Bootstrap fallback: LLM sector bootstrap unavailable ({error}), seeded fallback loaded."
+                        ),
+                    );
+                    return;
                 }
             }
         }
 
-        self.complete_new_game(world_seed, None);
+        let bootstrap_status = if self.llm_settings.enabled {
+            if self.llm_ready() {
+                "Bootstrap fallback: LLM bootstrap unavailable, seeded fallback loaded.".to_string()
+            } else {
+                "Bootstrap fallback: LLM configuration incomplete, seeded fallback loaded."
+                    .to_string()
+            }
+        } else {
+            "Bootstrap fallback: LLM disabled, seeded fallback loaded.".to_string()
+        };
+        self.complete_new_game(world_seed, None, bootstrap_status);
     }
 
-    fn complete_new_game(&mut self, world_seed: u64, world_flavor: Option<WorldFlavor>) {
+    fn complete_new_game(
+        &mut self,
+        world_seed: u64,
+        world_flavor: Option<WorldFlavor>,
+        bootstrap_status: String,
+    ) {
         self.reset_game_seeded(world_seed, world_flavor);
         self.pending_world_initialization = None;
+        self.action_overlay = None;
         self.inspect_overlay = None;
+        self.bootstrap_status = bootstrap_status.clone();
         self.has_active_game = true;
+        let clock = self.clock;
+        self.push_log(format!("[{clock:04}] {bootstrap_status}"));
         self.queue_pending_contract_flavors();
         self.screen = Screen::InGame;
         self.sync_end_screen();
@@ -616,18 +1031,32 @@ impl App {
         let model = settings.model.clone();
         let flavor_generator = Arc::clone(&self.flavor_generator);
         let sender = self.world_result_sender.clone();
+        let progress_sender = sender.clone();
 
         std::thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                flavor_generator.generate_sector(&settings, api_key.as_deref(), world_seed)
+                generate_sector_with_retries(
+                    flavor_generator.as_ref(),
+                    &settings,
+                    api_key.as_deref(),
+                    world_seed,
+                    |status| {
+                        let _ = progress_sender.send(WorldInitializationMessage::Progress {
+                            seed: world_seed,
+                            status,
+                        });
+                    },
+                )
             }))
             .unwrap_or_else(|_| Err("LLM sector bootstrap panicked".to_string()));
-            let _ = sender.send(WorldInitializationJobResult {
-                seed: world_seed,
-                provider_label,
-                model,
-                result,
-            });
+            let _ = sender.send(WorldInitializationMessage::Finished(
+                WorldInitializationJobResult {
+                    seed: world_seed,
+                    provider_label,
+                    model,
+                    result,
+                },
+            ));
         });
     }
 
@@ -642,44 +1071,78 @@ impl App {
     pub(crate) fn sync_background_work(&mut self) {
         let mut save_needed = false;
 
-        while let Ok(job) = self.world_result_receiver.try_recv() {
-            let Some(state) = self.pending_world_initialization.take() else {
-                continue;
-            };
-            if state.seed != job.seed {
-                self.pending_world_initialization = Some(state);
-                continue;
-            }
-
-            self.active_save_slot = state.slot_index;
-            self.load_slot_selection = state.slot_index;
-
-            match job.result {
-                Ok(world_flavor) => {
-                    let sector_name = world_flavor.environment_name.clone();
-                    self.last_llm_status =
-                        format!("LLM sector OK: {} via {}", job.provider_label, job.model);
-                    self.menu_feedback = Some(format!("Initialized environment: {}.", sector_name));
-                    if panic::catch_unwind(AssertUnwindSafe(|| {
-                        self.complete_new_game(job.seed, Some(world_flavor));
-                    }))
-                    .is_err()
+        while let Ok(message) = self.world_result_receiver.try_recv() {
+            match message {
+                WorldInitializationMessage::Progress { seed, status } => {
+                    if self
+                        .pending_world_initialization
+                        .as_ref()
+                        .is_some_and(|state| state.seed == seed)
                     {
-                        self.last_llm_status =
-                            "LLM sector apply failed; using fallback environment.".to_string();
-                        self.menu_feedback = Some(
+                        self.last_llm_status = status;
+                    }
+                    continue;
+                }
+                WorldInitializationMessage::Finished(job) => {
+                    let Some(state) = self.pending_world_initialization.take() else {
+                        continue;
+                    };
+                    if state.seed != job.seed {
+                        self.pending_world_initialization = Some(state);
+                        continue;
+                    }
+
+                    self.active_save_slot = state.slot_index;
+                    self.load_slot_selection = state.slot_index;
+
+                    match job.result {
+                        Ok(world_flavor) => {
+                            let sector_name = world_flavor.environment_name.clone();
+                            self.last_llm_status =
+                                format!("LLM sector OK: {} via {}", job.provider_label, job.model);
+                            self.menu_feedback =
+                                Some(format!("Initialized environment: {}.", sector_name));
+                            let bootstrap_status = format!(
+                                "Bootstrap source: LLM-generated environment via {} / {}.",
+                                job.provider_label, job.model
+                            );
+                            if panic::catch_unwind(AssertUnwindSafe(|| {
+                                self.complete_new_game(
+                                    job.seed,
+                                    Some(world_flavor),
+                                    bootstrap_status,
+                                );
+                            }))
+                            .is_err()
+                            {
+                                self.last_llm_status =
+                                    "LLM sector apply failed; using fallback environment."
+                                        .to_string();
+                                self.menu_feedback = Some(
                             "Generated sector application failed. Continuing with seeded fallback."
                                 .to_string(),
                         );
-                        self.complete_new_game(job.seed, None);
+                                self.complete_new_game(
+                            job.seed,
+                            None,
+                            "Bootstrap fallback: LLM sector generated output but applying it failed, seeded fallback loaded.".to_string(),
+                        );
+                            }
+                        }
+                        Err(error) => {
+                            self.last_llm_status = format!("LLM sector bootstrap failed: {error}");
+                            self.menu_feedback = Some(format!(
+                                "LLM sector bootstrap failed: {error}. Continuing with seeded fallback."
+                            ));
+                            self.complete_new_game(
+                        job.seed,
+                        None,
+                        format!(
+                            "Bootstrap fallback: LLM sector bootstrap failed ({error}), seeded fallback loaded."
+                        ),
+                    );
+                        }
                     }
-                }
-                Err(error) => {
-                    self.last_llm_status = format!("LLM sector bootstrap failed: {error}");
-                    self.menu_feedback = Some(format!(
-                        "LLM sector bootstrap failed: {error}. Continuing with seeded fallback."
-                    ));
-                    self.complete_new_game(job.seed, None);
                 }
             }
         }
@@ -844,7 +1307,14 @@ impl App {
         let charted = save
             .discovered_locations
             .iter()
-            .filter(|&&seen| seen)
+            .enumerate()
+            .filter(|(index, seen)| {
+                **seen
+                    || save
+                        .locations
+                        .get(*index)
+                        .is_some_and(|location| location.charted_empty)
+            })
             .count();
         let tracked = save
             .contracts
@@ -907,6 +1377,27 @@ impl App {
             world_seed: self.world_seed,
             sector_name: self.sector_name.clone(),
             sector_summary: self.sector_summary.clone(),
+            bootstrap_status: self.bootstrap_status.clone(),
+            exploration_cursor: self.exploration_cursor.into(),
+            exploration_traces: self
+                .exploration_traces
+                .iter()
+                .map(|trace| crate::save::SavedExplorationTrace {
+                    origin: trace.origin,
+                    target: trace.target.into(),
+                    outcome: match trace.outcome {
+                        crate::game::ExplorationTraceOutcome::Discovery => {
+                            crate::save::SavedExplorationTraceOutcome::Discovery
+                        }
+                        crate::game::ExplorationTraceOutcome::Miss => {
+                            crate::save::SavedExplorationTraceOutcome::Miss
+                        }
+                        crate::game::ExplorationTraceOutcome::Empty => {
+                            crate::save::SavedExplorationTraceOutcome::Empty
+                        }
+                    },
+                })
+                .collect(),
             locations: self
                 .locations
                 .iter()
@@ -925,6 +1416,9 @@ impl App {
                     system_coords: location.system_coords.into(),
                     travel_time_from_hub: location.travel_time_from_hub,
                     reveal_on_arrival: location.reveal_on_arrival,
+                    exploration_attempts: location.exploration_attempts,
+                    exploration_exhausted: location.exploration_exhausted,
+                    charted_empty: location.charted_empty,
                 })
                 .collect(),
             discovered_locations: self.discovered_locations.clone(),
@@ -974,6 +1468,10 @@ impl App {
                             eta_remaining,
                             total_eta,
                             exploration_run,
+                            exploration_target,
+                            exploration_discoveries,
+                            exploration_revealed_count,
+                            exploration_outcome,
                             segments,
                             segment_costs,
                             route,
@@ -986,6 +1484,20 @@ impl App {
                             eta_remaining: *eta_remaining,
                             total_eta: *total_eta,
                             exploration_run: *exploration_run,
+                            exploration_target: exploration_target.map(Into::into),
+                            exploration_discoveries: exploration_discoveries.clone(),
+                            exploration_revealed_count: *exploration_revealed_count,
+                            exploration_outcome: exploration_outcome.map(|outcome| match outcome {
+                                crate::game::ExplorationTraceOutcome::Discovery => {
+                                    crate::save::SavedExplorationTraceOutcome::Discovery
+                                }
+                                crate::game::ExplorationTraceOutcome::Miss => {
+                                    crate::save::SavedExplorationTraceOutcome::Miss
+                                }
+                                crate::game::ExplorationTraceOutcome::Empty => {
+                                    crate::save::SavedExplorationTraceOutcome::Empty
+                                }
+                            }),
                             segments: segments.clone(),
                             segment_costs: segment_costs.clone(),
                             route: route.clone(),
@@ -1038,6 +1550,7 @@ impl App {
         };
 
         self.apply_save(save)?;
+        self.action_overlay = None;
         self.inspect_overlay = None;
         self.active_save_slot = slot_index;
         self.load_slot_selection = slot_index;
@@ -1122,6 +1635,9 @@ impl App {
             world_seed,
             sector_name,
             sector_summary,
+            bootstrap_status,
+            exploration_cursor,
+            exploration_traces,
             locations: saved_locations,
             discovered_locations: saved_discovered_locations,
             station_fuel: saved_station_fuel,
@@ -1152,6 +1668,30 @@ impl App {
         if !sector_summary.trim().is_empty() {
             self.sector_summary = sector_summary;
         }
+        self.bootstrap_status = if bootstrap_status.trim().is_empty() {
+            "Bootstrap status not recorded for this save.".to_string()
+        } else {
+            bootstrap_status
+        };
+        self.exploration_cursor = exploration_cursor.into();
+        self.exploration_traces = exploration_traces
+            .into_iter()
+            .map(|trace| crate::game::ExplorationTrace {
+                origin: trace.origin.min(self.locations.len() - 1),
+                target: trace.target.into(),
+                outcome: match trace.outcome {
+                    crate::save::SavedExplorationTraceOutcome::Discovery => {
+                        crate::game::ExplorationTraceOutcome::Discovery
+                    }
+                    crate::save::SavedExplorationTraceOutcome::Miss => {
+                        crate::game::ExplorationTraceOutcome::Miss
+                    }
+                    crate::save::SavedExplorationTraceOutcome::Empty => {
+                        crate::game::ExplorationTraceOutcome::Empty
+                    }
+                },
+            })
+            .collect();
 
         if !saved_locations.is_empty() {
             for (index, location) in saved_locations.into_iter().enumerate() {
@@ -1181,6 +1721,9 @@ impl App {
                     system_coords: location.system_coords.into(),
                     travel_time_from_hub: location.travel_time_from_hub,
                     reveal_on_arrival: location.reveal_on_arrival,
+                    exploration_attempts: location.exploration_attempts,
+                    exploration_exhausted: location.exploration_exhausted,
+                    charted_empty: location.charted_empty,
                 };
             }
         }
@@ -1256,6 +1799,10 @@ impl App {
                         eta_remaining,
                         total_eta,
                         exploration_run,
+                        exploration_target,
+                        exploration_discoveries,
+                        exploration_revealed_count,
+                        exploration_outcome,
                         segments,
                         segment_costs,
                         route,
@@ -1268,6 +1815,20 @@ impl App {
                         eta_remaining,
                         total_eta: total_eta.max(eta_remaining),
                         exploration_run,
+                        exploration_target: exploration_target.map(Into::into),
+                        exploration_discoveries,
+                        exploration_revealed_count,
+                        exploration_outcome: exploration_outcome.map(|outcome| match outcome {
+                            crate::save::SavedExplorationTraceOutcome::Discovery => {
+                                crate::game::ExplorationTraceOutcome::Discovery
+                            }
+                            crate::save::SavedExplorationTraceOutcome::Miss => {
+                                crate::game::ExplorationTraceOutcome::Miss
+                            }
+                            crate::save::SavedExplorationTraceOutcome::Empty => {
+                                crate::game::ExplorationTraceOutcome::Empty
+                            }
+                        }),
                         segments: if segments.is_empty() {
                             vec![(
                                 origin.min(locations_len - 1),
@@ -1358,6 +1919,17 @@ impl App {
             },
         };
         self.sync_map_focus_to_selected_location();
+        if matches!(
+            self.mode,
+            AppMode::SelectingDestination {
+                intent: DispatchIntent::Exploration,
+                ..
+            }
+        ) {
+            if let Some(ship_index) = self.pending_ship() {
+                self.reset_exploration_cursor(ship_index);
+            }
+        }
         self.log = if log.is_empty() {
             vec!["[0000] Save loaded.".to_string()]
         } else {
@@ -1471,6 +2043,7 @@ impl App {
         }
 
         self.game.tick();
+        self.sync_action_feedback_popup();
         self.sync_end_screen();
         let _ = self.save_game();
     }
@@ -1762,6 +2335,51 @@ impl App {
             };
         }
 
+        if self.action_overlay.is_some() {
+            return self.handle_action_overlay_key(key);
+        }
+
+        if matches!(
+            self.mode,
+            AppMode::SelectingDestination {
+                intent: DispatchIntent::Exploration,
+                ..
+            }
+        ) && self.active_pane == crate::game::MAP_PANE
+        {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('q'), _) => return true,
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
+                (KeyCode::Left, _) => {
+                    self.move_exploration_cursor(-3, 0);
+                    return false;
+                }
+                (KeyCode::Right, _) => {
+                    self.move_exploration_cursor(3, 0);
+                    return false;
+                }
+                (KeyCode::Up, _) => {
+                    self.move_exploration_cursor(0, -2);
+                    return false;
+                }
+                (KeyCode::Down, _) => {
+                    self.move_exploration_cursor(0, 2);
+                    return false;
+                }
+                (KeyCode::Char('z') | KeyCode::Char('x'), _) => {
+                    self.map_zoom = crate::game::MapZoom::Sector;
+                    return false;
+                }
+                (KeyCode::Char('g'), _) => {
+                    if let Some(ship_index) = self.pending_ship() {
+                        self.reset_exploration_cursor(ship_index);
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => true,
@@ -1776,6 +2394,7 @@ impl App {
                 } else if self.cancel_dispatch() {
                     false
                 } else {
+                    self.action_overlay = None;
                     self.inspect_overlay = None;
                     self.menu_feedback = self
                         .save_game()
@@ -1819,6 +2438,50 @@ impl App {
             (KeyCode::Char('g'), _) if self.active_pane == crate::game::MAP_PANE => {
                 self.auto_focus_map();
                 self.sync_inspect_overlay();
+                false
+            }
+            (KeyCode::Delete | KeyCode::Backspace, _)
+                if self.active_pane == crate::game::CONTRACTS_PANE
+                    && matches!(self.mode, crate::game::AppMode::Browse)
+                    && matches!(
+                        self.contracts[self.selected_contract].state,
+                        crate::game::ContractState::Accepted { .. }
+                    ) =>
+            {
+                self.toggle_contract_tracking();
+                self.sync_action_feedback_popup();
+                self.sync_end_screen();
+                let _ = self.save_game();
+                false
+            }
+            (KeyCode::Enter, _)
+                if self.active_pane == crate::game::CONTRACTS_PANE
+                    && matches!(self.mode, crate::game::AppMode::Browse) =>
+            {
+                self.handle_contract_primary_action();
+                self.sync_action_feedback_popup();
+                self.sync_end_screen();
+                let _ = self.save_game();
+                false
+            }
+            (KeyCode::Enter, _)
+                if self.active_pane == crate::game::FLEET_PANE
+                    && matches!(self.mode, crate::game::AppMode::Browse) =>
+            {
+                self.open_ship_actions_overlay();
+                self.sync_action_feedback_popup();
+                self.sync_end_screen();
+                let _ = self.save_game();
+                false
+            }
+            (KeyCode::Enter, _)
+                if self.active_pane == crate::game::MAP_PANE
+                    && matches!(self.mode, crate::game::AppMode::Browse) =>
+            {
+                self.open_station_actions_overlay();
+                self.sync_action_feedback_popup();
+                self.sync_end_screen();
+                let _ = self.save_game();
                 false
             }
             (KeyCode::Enter, _) => {
@@ -1865,7 +2528,7 @@ impl App {
                 if self.active_pane == crate::game::MAP_PANE
                     && matches!(self.mode, crate::game::AppMode::Browse) =>
             {
-                self.transfer_player_to_selected_location();
+                self.open_player_transfer_overlay();
                 self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
@@ -1886,6 +2549,7 @@ impl App {
                 false
             }
             (KeyCode::Char('s'), _) => {
+                self.action_overlay = None;
                 self.inspect_overlay = None;
                 self.settings_return_screen = Screen::InGame;
                 self.settings_selection = self.tick_speed_index;
@@ -1912,6 +2576,80 @@ pub(crate) enum InspectOverlay {
     Fleet,
     Shipyard,
     Signals,
+}
+
+#[derive(Clone)]
+pub(crate) enum ActionOverlay {
+    ShipPicker(ShipPickerOverlay),
+    ShipActions(ShipActionsOverlay),
+    StationActions(StationActionsOverlay),
+}
+
+#[derive(Clone)]
+pub(crate) struct ShipPickerOverlay {
+    pub(crate) mode: ShipPickerMode,
+    pub(crate) ship_indices: Vec<usize>,
+    pub(crate) selection: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ShipPickerMode {
+    PlayerTransfer { destination: usize },
+    ContractDispatch { contract_index: usize },
+}
+
+#[derive(Clone)]
+pub(crate) struct ShipActionsOverlay {
+    pub(crate) ship_index: usize,
+    pub(crate) options: Vec<ShipActionOption>,
+    pub(crate) selection: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ShipActionOption {
+    Dispatch,
+    Explore,
+    Refuel,
+    TransferFuel,
+    Upgrade,
+}
+
+impl ShipActionOption {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Dispatch => "Dispatch",
+            Self::Explore => "Explore",
+            Self::Refuel => "Refuel",
+            Self::TransferFuel => "Transfer Fuel",
+            Self::Upgrade => "Upgrade",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StationActionsOverlay {
+    pub(crate) destination: usize,
+    pub(crate) options: Vec<StationActionOption>,
+    pub(crate) selection: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StationActionOption {
+    DispatchSelectedShip,
+    ExploreHere,
+    TransferFlight,
+    BuySelectedHull,
+}
+
+impl StationActionOption {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::DispatchSelectedShip => "Dispatch Selected Ship",
+            Self::ExploreHere => "Explore Ray",
+            Self::TransferFlight => "Transfer Flight",
+            Self::BuySelectedHull => "Buy Selected Hull",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1962,6 +2700,11 @@ struct WorldInitializationJobResult {
     provider_label: String,
     model: String,
     result: Result<WorldFlavor, String>,
+}
+
+enum WorldInitializationMessage {
+    Progress { seed: u64, status: String },
+    Finished(WorldInitializationJobResult),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2229,110 +2972,161 @@ impl ContractFlavorGenerator for BlockingFlavorGenerator {
 }
 
 #[cfg(test)]
+struct RetryingWorldBootstrapGenerator {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+    fail_before_success: usize,
+}
+
+#[cfg(test)]
+impl ContractFlavorGenerator for RetryingWorldBootstrapGenerator {
+    fn test_connection(
+        &self,
+        _settings: &LlmSettings,
+        _api_key: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn generate_sector(
+        &self,
+        _settings: &LlmSettings,
+        _api_key: Option<&str>,
+        _world_seed: u64,
+    ) -> Result<WorldFlavor, String> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if attempt <= self.fail_before_success {
+            Err(
+                "error sending request for url (http://localhost:8049/v1/chat/completions)"
+                    .to_string(),
+            )
+        } else {
+            Ok(test_world_flavor("Retried Bootstrap Sector"))
+        }
+    }
+
+    fn generate_flavor(
+        &self,
+        _settings: &LlmSettings,
+        _api_key: Option<&str>,
+        contract: &Contract,
+        _difficulty: Difficulty,
+        _locations: &[crate::game::Location],
+    ) -> Result<GeneratedContractFlavor, String> {
+        Ok(GeneratedContractFlavor {
+            title: contract.title.clone(),
+            briefing: contract.briefing.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
 fn test_world_flavor(sector_name: &str) -> WorldFlavor {
     WorldFlavor {
         environment_name: sector_name.to_string(),
         environment_summary: "Generated test environment summary.".to_string(),
         locations: vec![
             crate::game::WorldLocationFlavor {
-                region_name: "Helios Frontier".to_string(),
-                sector_name: "Astra Corridor".to_string(),
-                name: "Astra Prime".to_string(),
-                short_label: "Astra".to_string(),
-                lane_name: "Central Exchange".to_string(),
+                region_name: "Auric Reach".to_string(),
+                sector_name: "Luma Strand".to_string(),
+                name: "Luma Bastion".to_string(),
+                short_label: "Luma".to_string(),
+                lane_name: "Bastion Thread".to_string(),
                 description: "A generated hub.".to_string(),
-                cluster_name: "Helios Delta".to_string(),
-                system_name: "Astra Line".to_string(),
+                cluster_name: "Glass Delta".to_string(),
+                system_name: "Luma Arc".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Helios Frontier".to_string(),
-                sector_name: "Astra Corridor".to_string(),
-                name: "Kite Station".to_string(),
-                short_label: "Kite".to_string(),
-                lane_name: "Kite Spur".to_string(),
+                region_name: "Auric Reach".to_string(),
+                sector_name: "Luma Strand".to_string(),
+                name: "Needle Relay".to_string(),
+                short_label: "Needle".to_string(),
+                lane_name: "Needle Thread".to_string(),
                 description: "A generated relay.".to_string(),
-                cluster_name: "Ravel Spur".to_string(),
-                system_name: "Kite Rise".to_string(),
+                cluster_name: "Spindle Verge".to_string(),
+                system_name: "Needle Rise".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Helios Frontier".to_string(),
-                sector_name: "Astra Corridor".to_string(),
-                name: "Ion Anchorage".to_string(),
-                short_label: "Ion".to_string(),
-                lane_name: "Ion Run".to_string(),
+                region_name: "Auric Reach".to_string(),
+                sector_name: "Luma Strand".to_string(),
+                name: "Forge Anchorage".to_string(),
+                short_label: "Forge".to_string(),
+                lane_name: "Forge Run".to_string(),
                 description: "A generated anchorage.".to_string(),
-                cluster_name: "Ion Expanse".to_string(),
-                system_name: "Relay Verge".to_string(),
+                cluster_name: "Cinder Shelf".to_string(),
+                system_name: "Forge Verge".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Helios Frontier".to_string(),
-                sector_name: "Astra Corridor".to_string(),
-                name: "Dust Harbor".to_string(),
-                short_label: "Dust".to_string(),
-                lane_name: "Dust Corridor".to_string(),
+                region_name: "Auric Reach".to_string(),
+                sector_name: "Luma Strand".to_string(),
+                name: "Cairn Harbor".to_string(),
+                short_label: "Cairn".to_string(),
+                lane_name: "Cairn Drift".to_string(),
                 description: "A generated harbor.".to_string(),
-                cluster_name: "Helios Delta".to_string(),
-                system_name: "Astra Line".to_string(),
+                cluster_name: "Glass Delta".to_string(),
+                system_name: "Luma Arc".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Helios Frontier".to_string(),
-                sector_name: "Astra Corridor".to_string(),
-                name: "Outer Ring Relay".to_string(),
-                short_label: "Relay".to_string(),
-                lane_name: "Relay Ascent".to_string(),
+                region_name: "Auric Reach".to_string(),
+                sector_name: "Luma Strand".to_string(),
+                name: "Halo Array".to_string(),
+                short_label: "Halo".to_string(),
+                lane_name: "Halo Ascent".to_string(),
                 description: "A generated relay terminus.".to_string(),
-                cluster_name: "Ion Expanse".to_string(),
-                system_name: "Relay Verge".to_string(),
+                cluster_name: "Cinder Shelf".to_string(),
+                system_name: "Halo Verge".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Perihelion Reach".to_string(),
-                sector_name: "Vesper March".to_string(),
-                name: "Vesper Exchange".to_string(),
-                short_label: "Vesper".to_string(),
-                lane_name: "March Nexus".to_string(),
+                region_name: "Noctis Span".to_string(),
+                sector_name: "Mirage Step".to_string(),
+                name: "Mirage Exchange".to_string(),
+                short_label: "Mirage".to_string(),
+                lane_name: "Mirage Nexus".to_string(),
                 description: "A generated second hub.".to_string(),
-                cluster_name: "Vesper Crown".to_string(),
-                system_name: "March Line".to_string(),
+                cluster_name: "Mirror Crown".to_string(),
+                system_name: "Mirage Span".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Perihelion Reach".to_string(),
-                sector_name: "Vesper March".to_string(),
-                name: "Wick Relay".to_string(),
-                short_label: "Wick".to_string(),
-                lane_name: "Wick Spur".to_string(),
+                region_name: "Noctis Span".to_string(),
+                sector_name: "Mirage Step".to_string(),
+                name: "Rift Relay".to_string(),
+                short_label: "Rift".to_string(),
+                lane_name: "Rift Spur".to_string(),
                 description: "A generated second relay.".to_string(),
-                cluster_name: "Cinder Spur".to_string(),
-                system_name: "Wick Rise".to_string(),
+                cluster_name: "Rift Needle".to_string(),
+                system_name: "Rift Rise".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Perihelion Reach".to_string(),
-                sector_name: "Vesper March".to_string(),
-                name: "Cinder Anchorage".to_string(),
-                short_label: "Cinder".to_string(),
-                lane_name: "Cinder Run".to_string(),
+                region_name: "Noctis Span".to_string(),
+                sector_name: "Mirage Step".to_string(),
+                name: "Braid Anchorage".to_string(),
+                short_label: "Braid".to_string(),
+                lane_name: "Braid Run".to_string(),
                 description: "A generated second anchorage.".to_string(),
-                cluster_name: "Cinder Spur".to_string(),
-                system_name: "Foundry Verge".to_string(),
+                cluster_name: "Braid Shelf".to_string(),
+                system_name: "Braid Verge".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Perihelion Reach".to_string(),
-                sector_name: "Vesper March".to_string(),
-                name: "Ember Harbor".to_string(),
-                short_label: "Ember".to_string(),
-                lane_name: "Ember Drift".to_string(),
+                region_name: "Noctis Span".to_string(),
+                sector_name: "Mirage Step".to_string(),
+                name: "Veil Harbor".to_string(),
+                short_label: "Veil".to_string(),
+                lane_name: "Veil Drift".to_string(),
                 description: "A generated second harbor.".to_string(),
-                cluster_name: "Vesper Crown".to_string(),
-                system_name: "March Line".to_string(),
+                cluster_name: "Mirror Crown".to_string(),
+                system_name: "Mirage Span".to_string(),
             },
             crate::game::WorldLocationFlavor {
-                region_name: "Perihelion Reach".to_string(),
-                sector_name: "Vesper March".to_string(),
-                name: "Far Signal Array".to_string(),
-                short_label: "Signal".to_string(),
-                lane_name: "Signal Ascent".to_string(),
+                region_name: "Noctis Span".to_string(),
+                sector_name: "Mirage Step".to_string(),
+                name: "Prism Signal".to_string(),
+                short_label: "Prism".to_string(),
+                lane_name: "Prism Ascent".to_string(),
                 description: "A generated remote array.".to_string(),
-                cluster_name: "Foundry Verge".to_string(),
-                system_name: "Foundry Verge".to_string(),
+                cluster_name: "Braid Shelf".to_string(),
+                system_name: "Prism Verge".to_string(),
             },
         ],
         starter_ships: vec![
@@ -2382,7 +3176,10 @@ mod tests {
     use std::{
         cell::RefCell,
         rc::Rc,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -2468,6 +3265,14 @@ mod tests {
         app.selected_contract = 0;
         app.tracked_contract = Some(0);
         app.credits = 321;
+        app.bootstrap_status =
+            "Bootstrap source: LLM-generated environment via Test / demo-model.".to_string();
+        app.exploration_cursor = crate::game::MapPoint { x: 77, y: 19 };
+        app.exploration_traces = vec![crate::game::ExplorationTrace {
+            origin: crate::game::ASTRA_PRIME,
+            target: crate::game::MapPoint { x: 72, y: 16 },
+            outcome: crate::game::ExplorationTraceOutcome::Empty,
+        }];
         app.discovered_locations[crate::game::KITE_STATION] = true;
         app.contracts[0].state = crate::game::ContractState::Assigned {
             ship_index: 0,
@@ -2481,6 +3286,10 @@ mod tests {
             eta_remaining: 3,
             total_eta: 5,
             exploration_run: false,
+            exploration_target: None,
+            exploration_discoveries: Vec::new(),
+            exploration_revealed_count: 0,
+            exploration_outcome: None,
             segments: vec![(crate::game::ASTRA_PRIME, crate::game::DUST_HARBOR)],
             segment_costs: vec![5],
             route: "Astra Prime -> Dust Harbor".to_string(),
@@ -2501,6 +3310,13 @@ mod tests {
         assert_eq!(restored.credits, 321);
         assert_eq!(restored.tracked_contract, Some(0));
         assert!(restored.discovered_locations[crate::game::KITE_STATION]);
+        assert_eq!(
+            restored.bootstrap_status,
+            "Bootstrap source: LLM-generated environment via Test / demo-model."
+        );
+        assert_eq!(restored.exploration_cursor.x, 77);
+        assert_eq!(restored.exploration_cursor.y, 19);
+        assert_eq!(restored.exploration_traces.len(), 1);
         assert_eq!(restored.log[0], "[0042] persistence check");
         assert_eq!(restored.fleet[0].current_fuel, 4);
         assert_eq!(restored.fleet[0].max_fuel, 14);
@@ -2568,6 +3384,104 @@ mod tests {
         assert_eq!(restored_ship.description, purchased_description);
         assert_eq!(restored_ship.speed, purchased_speed);
         assert_eq!(restored_ship.max_fuel, purchased_fuel);
+    }
+
+    #[test]
+    fn mission_board_enter_opens_ship_picker_overlay() {
+        let store = MemorySaveStore::new();
+        let mut app = App::with_store(Box::new(store), GameData::new(Difficulty::Normal));
+        app.screen = Screen::InGame;
+        app.active_pane = crate::game::CONTRACTS_PANE;
+        app.discovered_locations[crate::game::KITE_STATION] = true;
+        app.selected_contract = 3;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Some(ActionOverlay::ShipPicker(overlay)) = app.action_overlay.as_ref() else {
+            panic!("expected ship picker overlay");
+        };
+        assert!(matches!(
+            overlay.mode,
+            ShipPickerMode::ContractDispatch { contract_index: 3 }
+        ));
+        assert_eq!(overlay.ship_indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn map_transfer_opens_ship_picker_when_selected_ship_cannot_take_trip() {
+        let store = MemorySaveStore::new();
+        let mut app = App::with_store(Box::new(store), GameData::new(Difficulty::Normal));
+        app.screen = Screen::InGame;
+        app.active_pane = crate::game::MAP_PANE;
+        app.selected_location = crate::game::DUST_HARBOR;
+        app.selected_ship = 1;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+
+        let Some(ActionOverlay::ShipPicker(overlay)) = app.action_overlay.as_ref() else {
+            panic!("expected ship picker overlay");
+        };
+        assert!(matches!(
+            overlay.mode,
+            ShipPickerMode::PlayerTransfer {
+                destination: crate::game::DUST_HARBOR
+            }
+        ));
+        assert_eq!(overlay.ship_indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn map_transfer_auto_uses_the_last_local_ship() {
+        let store = MemorySaveStore::new();
+        let mut app = App::with_store(Box::new(store), GameData::new(Difficulty::Normal));
+        app.screen = Screen::InGame;
+        app.active_pane = crate::game::MAP_PANE;
+        app.selected_location = crate::game::DUST_HARBOR;
+        app.selected_ship = 1;
+        app.fleet[2].current_location = crate::game::KITE_STATION;
+        app.fleet[2].state = crate::game::ShipState::Docked;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+
+        assert!(app.action_overlay.is_none());
+        assert_eq!(app.player_in_transit_ship, None);
+        assert_eq!(app.player_location, crate::game::DUST_HARBOR);
+        assert_eq!(app.fleet[0].current_location, crate::game::DUST_HARBOR);
+    }
+
+    #[test]
+    fn fleet_enter_opens_ship_actions_overlay() {
+        let store = MemorySaveStore::new();
+        let mut app = App::with_store(Box::new(store), GameData::new(Difficulty::Normal));
+        app.screen = Screen::InGame;
+        app.active_pane = crate::game::FLEET_PANE;
+        app.selected_ship = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Some(ActionOverlay::ShipActions(overlay)) = app.action_overlay.as_ref() else {
+            panic!("expected ship actions overlay");
+        };
+        assert_eq!(overlay.ship_index, 0);
+        assert_eq!(overlay.options.len(), 5);
+    }
+
+    #[test]
+    fn map_enter_opens_station_actions_overlay() {
+        let store = MemorySaveStore::new();
+        let mut app = App::with_store(Box::new(store), GameData::new(Difficulty::Normal));
+        app.screen = Screen::InGame;
+        app.active_pane = crate::game::MAP_PANE;
+        app.selected_location = crate::game::DUST_HARBOR;
+        app.discovered_locations[crate::game::KITE_STATION] = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Some(ActionOverlay::StationActions(overlay)) = app.action_overlay.as_ref() else {
+            panic!("expected station actions overlay");
+        };
+        assert_eq!(overlay.destination, crate::game::DUST_HARBOR);
+        assert!(overlay.options.len() >= 2);
     }
 
     #[test]
@@ -2641,6 +3555,34 @@ mod tests {
     }
 
     #[test]
+    fn llm_enabled_with_bad_connection_does_not_gate_on_app_init() {
+        let app = App::with_dependencies(
+            Box::new(MemorySaveStore::new()),
+            Box::new(TestSettingsStore::default()),
+            Box::new(TestSecretStore {
+                api_key: Rc::new(RefCell::new(Some("token".to_string()))),
+            }),
+            Arc::new(FailingConnectionGenerator),
+            GameData::new(Difficulty::Normal),
+            AppSettings {
+                tick_speed_index: 1,
+                difficulty: Difficulty::Normal,
+                llm: LlmSettings {
+                    enabled: true,
+                    provider: LlmProviderPreset::OpenAI,
+                    endpoint_url: "https://bad.example/v1/chat/completions".to_string(),
+                    model: "demo-model".to_string(),
+                    timeout_secs: 5,
+                },
+            },
+            true,
+        );
+
+        assert_eq!(app.screen, Screen::StartMenu);
+        assert_eq!(app.last_llm_status, "LLM not tested yet.");
+    }
+
+    #[test]
     fn new_game_queues_contract_flavor_generation_in_background() {
         let world_ready = Arc::new(AtomicBool::new(false));
         let flavor_ready = Arc::new(AtomicBool::new(false));
@@ -2700,6 +3642,52 @@ mod tests {
                 .iter()
                 .all(|contract| contract.title.starts_with("LLM "))
         );
+    }
+
+    #[test]
+    fn new_game_retries_transient_world_bootstrap_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut app = App::with_dependencies(
+            Box::new(MemorySaveStore::new()),
+            Box::new(TestSettingsStore::default()),
+            Box::new(TestSecretStore::default()),
+            Arc::new(RetryingWorldBootstrapGenerator {
+                attempts: Arc::clone(&attempts),
+                fail_before_success: 2,
+            }),
+            GameData::new(Difficulty::Normal),
+            AppSettings {
+                tick_speed_index: 1,
+                difficulty: Difficulty::Normal,
+                llm: LlmSettings {
+                    enabled: true,
+                    provider: LlmProviderPreset::Ollama,
+                    endpoint_url: "http://localhost:11434/v1".to_string(),
+                    model: "llama3.1".to_string(),
+                    timeout_secs: 5,
+                },
+            },
+            false,
+        );
+
+        assert!(!app.activate_start_menu_selection());
+        assert_eq!(app.screen, Screen::InitializingWorld);
+
+        for _ in 0..100 {
+            app.sync_background_work();
+            if app.screen == Screen::InGame {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(app.screen, Screen::InGame);
+        assert!(app.has_active_game);
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+        assert!(app.bootstrap_status.contains("LLM-generated environment"));
+        assert_eq!(app.sector_name, "Retried Bootstrap Sector");
+        assert_eq!(app.locations[0].name, "Luma Bastion");
+        assert_eq!(app.locations[5].name, "Mirage Exchange");
     }
 
     #[test]
