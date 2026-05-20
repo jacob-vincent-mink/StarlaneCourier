@@ -38,6 +38,7 @@ pub(crate) struct App {
     pub(crate) has_active_game: bool,
     pub(crate) menu_feedback: Option<String>,
     pub(crate) popup_message: Option<String>,
+    pub(crate) inspect_overlay: Option<InspectOverlay>,
     pub(crate) llm_gate_selection: usize,
     pub(crate) start_menu_selection: usize,
     pub(crate) active_save_slot: usize,
@@ -132,6 +133,7 @@ impl App {
             has_active_game: false,
             menu_feedback: None,
             popup_message: None,
+            inspect_overlay: None,
             llm_gate_selection: 0,
             start_menu_selection: 0,
             active_save_slot: 0,
@@ -173,18 +175,46 @@ impl App {
     }
 
     pub(crate) fn controls_text(&self) -> String {
-        match self.mode {
-            AppMode::Browse => {
-                "Tab/Shift+Tab or Left/Right: focus   Up/Down: select   Enter: board/fleet/shipyard/alerts action   e: exploration run   m: move player   z/x: map zoom   g: map auto-focus   b: buy selected shipyard hull   f: refuel   t: transfer fuel   u: upgrade ship   r: regenerate flavor   s: settings   Esc: menu   q/Ctrl+C: quit"
-                    .to_string()
-            }
-            AppMode::SelectingDestination { intent, .. } => {
-                format!(
-                    "Up/Down: choose destination   z/x: map zoom   g: focus ship   Enter: confirm {}   Esc: cancel   q/Ctrl+C: quit",
-                    intent.label().to_lowercase()
-                )
-            }
+        if self.inspect_overlay.is_some() {
+            return "Tab/Shift+Tab or Left/Right: switch focus   Up/Down: select   i/Esc: close detail   Enter: primary action   e/f/t/u/m/b/r/z/x/g: context actions   s: settings   q/Ctrl+C: quit"
+                .to_string();
         }
+
+        match self.mode {
+            AppMode::Browse => "Tab/Shift+Tab or Left/Right: focus   Up/Down: select   i: inspect focused panel   Enter: primary action   e: exploration run   m: move player   z/x: map zoom   g: map auto-focus   b: buy selected shipyard hull   f: refuel   t: transfer fuel   u: upgrade ship   r: regenerate flavor   s: settings   Esc: menu   q/Ctrl+C: quit"
+                .to_string(),
+            AppMode::SelectingDestination { intent, .. } => format!(
+                "Up/Down: choose destination   z/x: map zoom   g: focus ship   i: inspect route detail   Enter: confirm {}   Esc: cancel   q/Ctrl+C: quit",
+                intent.label().to_lowercase()
+            ),
+        }
+    }
+
+    pub(crate) fn current_inspect_overlay(&self) -> Option<InspectOverlay> {
+        self.inspect_overlay
+    }
+
+    fn inspect_overlay_for_active_pane(&self) -> InspectOverlay {
+        match self.active_pane {
+            crate::game::CONTRACTS_PANE => InspectOverlay::MissionBoard,
+            crate::game::MAP_PANE => InspectOverlay::Station,
+            crate::game::FLEET_PANE => InspectOverlay::Fleet,
+            crate::game::SHIPYARD_PANE => InspectOverlay::Shipyard,
+            _ => InspectOverlay::Signals,
+        }
+    }
+
+    fn sync_inspect_overlay(&mut self) {
+        if self.inspect_overlay.is_some() {
+            self.inspect_overlay = Some(self.inspect_overlay_for_active_pane());
+        }
+    }
+
+    fn toggle_inspect_overlay(&mut self) {
+        self.inspect_overlay = match self.inspect_overlay {
+            Some(_) => None,
+            None => Some(self.inspect_overlay_for_active_pane()),
+        };
     }
 
     pub(crate) fn poll_duration(&self) -> Duration {
@@ -536,6 +566,7 @@ impl App {
         self.active_save_slot = self.load_slot_selection;
         let world_seed = self.generate_world_seed();
         self.pending_world_initialization = None;
+        self.inspect_overlay = None;
 
         if self.llm_ready() {
             match self.resolved_api_key() {
@@ -569,6 +600,7 @@ impl App {
     fn complete_new_game(&mut self, world_seed: u64, world_flavor: Option<WorldFlavor>) {
         self.reset_game_seeded(world_seed, world_flavor);
         self.pending_world_initialization = None;
+        self.inspect_overlay = None;
         self.has_active_game = true;
         self.queue_pending_contract_flavors();
         self.screen = Screen::InGame;
@@ -1006,6 +1038,7 @@ impl App {
         };
 
         self.apply_save(save)?;
+        self.inspect_overlay = None;
         self.active_save_slot = slot_index;
         self.load_slot_selection = slot_index;
         self.has_active_game = true;
@@ -1732,10 +1765,18 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => true,
+            (KeyCode::Char('i'), _) => {
+                self.toggle_inspect_overlay();
+                false
+            }
             (KeyCode::Esc, _) => {
-                if self.cancel_dispatch() {
+                if self.inspect_overlay.is_some() {
+                    self.inspect_overlay = None;
+                    false
+                } else if self.cancel_dispatch() {
                     false
                 } else {
+                    self.inspect_overlay = None;
                     self.menu_feedback = self
                         .save_game()
                         .err()
@@ -1747,34 +1788,42 @@ impl App {
             }
             (KeyCode::Tab | KeyCode::Right, _) => {
                 self.active_pane = (self.active_pane + 1) % PANE_COUNT;
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::BackTab | KeyCode::Left, _) => {
                 self.active_pane = (self.active_pane + PANE_COUNT - 1) % PANE_COUNT;
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Up, _) => {
                 self.move_selection(-1);
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Down, _) => {
                 self.move_selection(1);
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Char('z'), _) if self.active_pane == crate::game::MAP_PANE => {
                 self.zoom_in_map();
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Char('x'), _) if self.active_pane == crate::game::MAP_PANE => {
                 self.zoom_out_map();
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Char('g'), _) if self.active_pane == crate::game::MAP_PANE => {
                 self.auto_focus_map();
+                self.sync_inspect_overlay();
                 false
             }
             (KeyCode::Enter, _) => {
                 self.activate_selection();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1782,6 +1831,7 @@ impl App {
             }
             (KeyCode::Char('f'), _) => {
                 self.refuel_selected_ship();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1789,6 +1839,7 @@ impl App {
             }
             (KeyCode::Char('t'), _) => {
                 self.transfer_fuel_to_selected_ship();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1796,6 +1847,7 @@ impl App {
             }
             (KeyCode::Char('u'), _) => {
                 self.upgrade_selected_ship();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1803,6 +1855,7 @@ impl App {
             }
             (KeyCode::Char('e'), _) if self.active_pane == crate::game::FLEET_PANE => {
                 self.begin_exploration();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1813,6 +1866,7 @@ impl App {
                     && matches!(self.mode, crate::game::AppMode::Browse) =>
             {
                 self.transfer_player_to_selected_location();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
@@ -1825,12 +1879,14 @@ impl App {
                 ) =>
             {
                 self.purchase_ship_at_selected_location();
+                self.sync_inspect_overlay();
                 self.sync_action_feedback_popup();
                 self.sync_end_screen();
                 let _ = self.save_game();
                 false
             }
             (KeyCode::Char('s'), _) => {
+                self.inspect_overlay = None;
                 self.settings_return_screen = Screen::InGame;
                 self.settings_selection = self.tick_speed_index;
                 self.difficulty_selection = self.difficulty.index();
@@ -1847,6 +1903,15 @@ impl App {
             _ => false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InspectOverlay {
+    MissionBoard,
+    Station,
+    Fleet,
+    Shipyard,
+    Signals,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

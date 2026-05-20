@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, DIFFICULTY_OPTIONS, LLM_FIELDS, Screen, TICK_SPEEDS},
+    app::{App, DIFFICULTY_OPTIONS, InspectOverlay, LLM_FIELDS, Screen, TICK_SPEEDS},
     game::{
         CONTRACTS_PANE, Difficulty, FLEET_PANE, GOAL_CREDITS, LOG_PANE, Location, MAP_PANE,
         PANE_TITLES, RefuelPlan, RunOutcome, SECTOR_LOCATION_COUNT, SHIPYARD_PANE, Ship,
@@ -140,50 +140,25 @@ fn draw_game(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(16),
-            Constraint::Length(9),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
-    let top = Layout::default()
+    let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(40),
-            Constraint::Percentage(28),
-        ])
-        .split(areas[1]);
-
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(areas[2]);
-    let alert_sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(bottom[0]);
-    let right_sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(bottom[1]);
 
     let map_sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(5),
-            Constraint::Length(5),
-        ])
-        .split(top[1]);
-    let board_sections = Layout::default()
+        .constraints([Constraint::Min(12), Constraint::Length(7)])
+        .split(body[0]);
+    let focus_sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-        .split(top[0]);
-    let fleet_sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-        .split(top[2]);
+        .constraints([Constraint::Length(3), Constraint::Min(10)])
+        .split(body[1]);
 
     let header = Paragraph::new(Line::from(vec![
         "Starlane Courier".into(),
@@ -204,106 +179,32 @@ fn draw_game(frame: &mut Frame, app: &App) {
         .into(),
         "  ".into(),
         format!("Credits: {} cr", app.credits).into(),
-        "  ".into(),
-        format!("Difficulty: {}", app.difficulty.label()).into(),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Bridge"));
     frame.render_widget(header, areas[0]);
 
-    let contracts = List::new(
-        app.contracts
-            .iter()
-            .enumerate()
-            .map(|(index, _)| contract_list_item(app, index)),
-    )
-    .highlight_style(selection_style())
-    .highlight_symbol(">> ")
-    .block(pane_block(
-        PANE_TITLES[0],
-        app.active_pane == CONTRACTS_PANE,
-    ));
-    let mut contract_state = ListState::default();
-    contract_state.select(Some(app.selected_contract));
-    frame.render_stateful_widget(contracts, board_sections[0], &mut contract_state);
-
-    let contract_detail = Paragraph::new(Text::from(contract_detail_lines(app)))
+    let status = Paragraph::new(Text::from(bridge_status_lines(app)))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Contract Detail"),
+                .title("Operations Deck"),
         )
         .wrap(Wrap { trim: true });
-    frame.render_widget(contract_detail, board_sections[1]);
+    frame.render_widget(status, areas[1]);
 
     render_sector_map(frame, map_sections[0], app, app.active_pane == MAP_PANE);
 
-    let route_intel = Paragraph::new(Text::from(route_preview_lines(app)))
-        .block(Block::default().borders(Borders::ALL).title("Route Intel"))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(route_intel, map_sections[1]);
-
-    let station_info = Paragraph::new(Text::from(station_info_lines(app)))
-        .block(Block::default().borders(Borders::ALL).title("Station Info"))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(station_info, map_sections[2]);
-
-    let fleet = List::new(app.fleet.iter().enumerate().map(|(index, ship)| {
-        ship_list_item(
-            ship,
-            &app.locations,
-            &app.contracts,
-            app.pending_ship() == Some(index),
+    let station = Paragraph::new(Text::from(station_brief_lines(app)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Station"),
         )
-    }))
-    .highlight_style(selection_style())
-    .highlight_symbol(">> ")
-    .block(pane_block(PANE_TITLES[2], app.active_pane == FLEET_PANE));
-    let mut fleet_state = ListState::default();
-    fleet_state.select(Some(app.selected_ship));
-    frame.render_stateful_widget(fleet, fleet_sections[0], &mut fleet_state);
-
-    let ship_detail = Paragraph::new(Text::from(ship_detail_lines(app)))
-        .block(Block::default().borders(Borders::ALL).title("Ship Detail"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(ship_detail, fleet_sections[1]);
+    frame.render_widget(station, map_sections[1]);
 
-    let alerts_data = app.current_alerts();
-    let alerts = List::new(alerts_data.iter().map(|alert| {
-        let prefix = match alert.severity {
-            crate::game::AlertSeverity::Info => "Info: ",
-            crate::game::AlertSeverity::Warning => "Warn: ",
-            crate::game::AlertSeverity::Critical => "Critical: ",
-        };
-        ListItem::new(format!("{}{}", prefix, alert.summary))
-    }))
-    .highlight_style(selection_style())
-    .highlight_symbol(">> ")
-    .block(pane_block("Alerts", app.active_pane == LOG_PANE));
-    let mut alerts_state = ListState::default();
-    alerts_state.select(Some(
-        app.selected_alert.min(alerts_data.len().saturating_sub(1)),
-    ));
-    frame.render_stateful_widget(alerts, alert_sections[0], &mut alerts_state);
-
-    let log = List::new(app.log.iter().map(|entry| ListItem::new(entry.as_str())))
-        .block(pane_block(PANE_TITLES[4], app.active_pane == LOG_PANE));
-    frame.render_widget(log, alert_sections[1]);
-
-    let mission = Paragraph::new(Text::from(build_mission_text(app)))
-        .block(Block::default().borders(Borders::ALL).title("Mission"))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(mission, right_sections[0]);
-
-    let shipyard = List::new(shipyard_list_items(app))
-        .highlight_style(selection_style())
-        .highlight_symbol("$$ ")
-        .block(pane_block(PANE_TITLES[3], app.active_pane == SHIPYARD_PANE));
-    let mut shipyard_state = ListState::default();
-    let shipyard_count = app.shipyard_offer_count(app.selected_location);
-    shipyard_state.select(
-        (shipyard_count > 0).then_some(app.selected_shipyard_offer.min(shipyard_count - 1)),
-    );
-    frame.render_stateful_widget(shipyard, right_sections[1], &mut shipyard_state);
+    draw_focus_tabs(frame, focus_sections[0], app);
+    render_active_focus_panel(frame, focus_sections[1], app);
 
     let footer = Paragraph::new(Line::from(app.controls_text()))
         .block(Block::default().borders(Borders::ALL).title("Controls"));
@@ -316,6 +217,8 @@ fn draw_game(frame: &mut Frame, app: &App) {
             message,
             "Any key: dismiss   q/Ctrl+C: quit",
         );
+    } else if let Some(overlay) = app.current_inspect_overlay() {
+        draw_inspect_overlay(frame, app, overlay);
     }
 }
 
@@ -781,6 +684,599 @@ fn selection_style() -> Style {
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
+}
+
+fn pane_short_title(index: usize) -> &'static str {
+    match index {
+        CONTRACTS_PANE => "Board",
+        MAP_PANE => "Map",
+        FLEET_PANE => "Fleet",
+        SHIPYARD_PANE => "Yard",
+        LOG_PANE => "Signals",
+        _ => "Focus",
+    }
+}
+
+fn bridge_status_lines(app: &App) -> Vec<Line<'static>> {
+    let docked_count = app.fleet.len().saturating_sub(app.in_transit_count());
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Player ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(app.player_status_text()),
+        Span::raw("   "),
+        Span::styled(
+            "Fleet ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "{} docked / {} in transit",
+            docked_count,
+            app.in_transit_count()
+        )),
+        Span::raw("   "),
+        Span::styled(
+            "Difficulty ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(app.difficulty.label()),
+    ])];
+
+    match app.mode {
+        crate::game::AppMode::SelectingDestination { ship_index, intent } => {
+            lines.push(Line::from(format!(
+                "Planning {} for {} toward {}.",
+                intent.label().to_lowercase(),
+                app.fleet[ship_index].name,
+                app.location_name(app.selected_location)
+            )));
+        }
+        crate::game::AppMode::Browse => {
+            if let Some(contract_index) = app.tracked_contract {
+                let contract = &app.contracts[contract_index];
+                lines.push(Line::from(format!(
+                    "Tracked mission: {} | {} -> {} | {} cr | ETA <= {}",
+                    contract.title,
+                    app.location_name(contract.origin),
+                    app.location_name(contract.destination),
+                    app.contract_current_reward(contract_index),
+                    contract.max_eta,
+                )));
+            } else if let Some((frontier, _)) = app.next_discovery_target() {
+                lines.push(Line::from(format!(
+                    "Next lead: send an exploration run to {}.",
+                    app.location_name(frontier)
+                )));
+            } else {
+                lines.push(Line::from(
+                    "Environment fully charted. Push contracts and ship growth to reach the credit goal.",
+                ));
+            }
+        }
+    }
+
+    let signal = app
+        .current_alerts()
+        .first()
+        .map(|alert| alert.summary.clone())
+        .unwrap_or_else(|| "No urgent incidents.".to_string());
+    let suffix = if app.pending_contract_flavor_count() > 0 {
+        format!(" | LLM jobs {}", app.pending_contract_flavor_count())
+    } else {
+        let low_fuel = app.low_fuel_ship_names();
+        if low_fuel.is_empty() {
+            String::new()
+        } else {
+            format!(" | Low fuel: {}", low_fuel.join(", "))
+        }
+    };
+    lines.push(Line::from(format!(
+        "Focus: {} | Signal: {}{}",
+        pane_short_title(app.active_pane),
+        signal,
+        suffix
+    )));
+
+    lines
+}
+
+fn station_brief_lines(app: &App) -> Vec<Line<'static>> {
+    let index = app.selected_location;
+    let ship = &app.fleet[app.selected_ship];
+    let mut lines = vec![
+        Line::from(format!(
+            "{} | {} | {}",
+            app.location_name(index),
+            app.location_sector(index),
+            app.location_region(index)
+        )),
+        Line::from(app.location_description(index).to_string()),
+    ];
+
+    if let Some(plan) = app.plan_route_for_ship(app.selected_ship, index) {
+        lines.push(Line::from(format!(
+            "{} preview: ETA {} | fuel {} | {}",
+            ship.name, plan.eta, plan.fuel_required, plan.path
+        )));
+        if let Some(note) = app.active_mission_assignment_note(app.selected_ship, index, plan.eta) {
+            lines.push(Line::from(note));
+        }
+    } else if ship.is_docked() {
+        lines.push(Line::from(format!(
+            "{} preview: choose another charted station to plan a route.",
+            ship.name
+        )));
+    } else {
+        lines.push(Line::from(format!(
+            "{} is already in transit and cannot take new orders yet.",
+            ship.name
+        )));
+    }
+
+    lines.push(Line::from(if app.player_is_in_transit() {
+        format!("Player: {}", app.player_status_text())
+    } else if index == app.player_location {
+        "Player: present at this station".to_string()
+    } else {
+        match app.player_transfer_cost(index) {
+            Some(cost) => format!("Player transfer: {} cr with `m`", cost),
+            None => "Player transfer: unavailable right now".to_string(),
+        }
+    }));
+
+    let shipyard = if let Some(offer) = app.shipyard_offer(index) {
+        format!(
+            "Shipyard: {} offers | selected {} for {} cr",
+            app.shipyard_offer_count(index),
+            offer.name,
+            offer.price
+        )
+    } else if app.has_shipyard(index) {
+        "Shipyard: sold out until the next refresh".to_string()
+    } else {
+        "Shipyard: none active here".to_string()
+    };
+    let lead = app
+        .exploration_heading_hint(index)
+        .map(|heading| format!("Lead {}", heading))
+        .unwrap_or_else(|| format!("Docked ships {}", docked_ship_count_at(app, index)));
+    lines.push(Line::from(format!("{} | {}", shipyard, lead)));
+    lines.push(Line::from(
+        "Press `i` for full station, route, and marketplace detail.",
+    ));
+
+    lines
+}
+
+fn draw_focus_tabs(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = Vec::new();
+    for index in 0..PANE_TITLES.len() {
+        let style = if app.active_pane == index {
+            selection_style()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(
+            format!(" {} ", pane_short_title(index)),
+            style,
+        ));
+        if index < PANE_TITLES.len() - 1 {
+            spans.push(Span::raw(" "));
+        }
+    }
+
+    let tabs = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).title("Focus"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(tabs, area);
+}
+
+fn render_active_focus_panel(frame: &mut Frame, area: Rect, app: &App) {
+    match app.active_pane {
+        CONTRACTS_PANE => {
+            let contracts = List::new(
+                app.contracts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| contract_list_item(app, index)),
+            )
+            .highlight_style(selection_style())
+            .highlight_symbol(">> ")
+            .block(pane_block(PANE_TITLES[CONTRACTS_PANE], true));
+            let mut contract_state = ListState::default();
+            contract_state.select(Some(app.selected_contract));
+            frame.render_stateful_widget(contracts, area, &mut contract_state);
+        }
+        MAP_PANE => {
+            let title = if matches!(app.mode, crate::game::AppMode::SelectingDestination { .. }) {
+                "Route Planner"
+            } else {
+                "Station & Route"
+            };
+            let panel = Paragraph::new(Text::from(focused_map_lines(app)))
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(panel, area);
+        }
+        FLEET_PANE => {
+            let fleet = List::new(app.fleet.iter().enumerate().map(|(index, ship)| {
+                ship_list_item(
+                    ship,
+                    &app.locations,
+                    &app.contracts,
+                    app.pending_ship() == Some(index),
+                )
+            }))
+            .highlight_style(selection_style())
+            .highlight_symbol(">> ")
+            .block(pane_block(PANE_TITLES[FLEET_PANE], true));
+            let mut fleet_state = ListState::default();
+            fleet_state.select(Some(app.selected_ship));
+            frame.render_stateful_widget(fleet, area, &mut fleet_state);
+        }
+        SHIPYARD_PANE => {
+            let shipyard = List::new(shipyard_list_items(app))
+                .highlight_style(selection_style())
+                .highlight_symbol("$$ ")
+                .block(pane_block(PANE_TITLES[SHIPYARD_PANE], true));
+            let mut shipyard_state = ListState::default();
+            let shipyard_count = app.shipyard_offer_count(app.selected_location);
+            shipyard_state.select(if shipyard_count > 0 {
+                Some(app.selected_shipyard_offer.min(shipyard_count - 1))
+            } else {
+                None
+            });
+            frame.render_stateful_widget(shipyard, area, &mut shipyard_state);
+        }
+        LOG_PANE => {
+            let alerts_data = app.current_alerts();
+            let alerts = List::new(alerts_data.iter().map(|alert| {
+                let prefix = match alert.severity {
+                    crate::game::AlertSeverity::Info => "Info: ",
+                    crate::game::AlertSeverity::Warning => "Warn: ",
+                    crate::game::AlertSeverity::Critical => "Critical: ",
+                };
+                ListItem::new(format!("{}{}", prefix, alert.summary))
+            }))
+            .highlight_style(selection_style())
+            .highlight_symbol(">> ")
+            .block(pane_block("Signals", true));
+            let mut alerts_state = ListState::default();
+            alerts_state.select(Some(
+                app.selected_alert.min(alerts_data.len().saturating_sub(1)),
+            ));
+            frame.render_stateful_widget(alerts, area, &mut alerts_state);
+        }
+        _ => {}
+    }
+}
+
+fn focused_map_lines(app: &App) -> Vec<Line<'static>> {
+    let index = app.selected_location;
+    let ship = &app.fleet[app.selected_ship];
+    let mut lines = vec![
+        Line::from(format!(
+            "View: {} | {}",
+            app.map_zoom_label(),
+            app.map_scope_label()
+        )),
+        Line::from(format!("Focus: {}", app.map_focus_location_name())),
+        Line::from(format!(
+            "Selected destination: {}",
+            app.location_name(index)
+        )),
+        Line::from(app.location_description(index).to_string()),
+        Line::from(format!(
+            "Selected ship: {} ({})",
+            ship.name, ship.class_name
+        )),
+    ];
+
+    if let Some(intent) = app.pending_dispatch_intent() {
+        lines.push(Line::from(format!("Intent: {}", intent.label())));
+    }
+
+    if let Some(plan) = app.plan_route_for_ship(app.selected_ship, index) {
+        lines.push(Line::from(format!(
+            "Preview: ETA {} | fuel {} | {}",
+            plan.eta, plan.fuel_required, plan.path
+        )));
+        lines.push(Line::from(format!(
+            "Conditions: {}",
+            plan.condition_summary
+        )));
+        if let Some(note) = app.active_mission_assignment_note(app.selected_ship, index, plan.eta) {
+            lines.push(Line::from(note));
+        }
+    } else if ship.is_docked() {
+        lines.push(Line::from(
+            "Preview unavailable until you choose another charted station.",
+        ));
+    } else {
+        lines.push(Line::from(
+            "Preview unavailable while the selected ship is in transit.",
+        ));
+    }
+
+    lines.push(Line::from(
+        if app.player_can_operate_ship(app.selected_ship) {
+            "Local control: selected ship is operable here".to_string()
+        } else {
+            format!(
+                "Local control: transfer to {} before operating {}",
+                app.location_name(ship.current_location),
+                ship.name
+            )
+        },
+    ));
+
+    lines.push(Line::from(if let Some(offer) = app.shipyard_offer(index) {
+        format!(
+            "Shipyard: {} offers | selected {} ({}) for {} cr",
+            app.shipyard_offer_count(index),
+            offer.name,
+            offer.class_name,
+            offer.price
+        )
+    } else if app.has_shipyard(index) {
+        "Shipyard: sold out until next rotation".to_string()
+    } else {
+        "Shipyard: none at the selected station".to_string()
+    }));
+
+    lines.push(Line::from(
+        "`i` opens full route detail. `m` transfers the player. `b` buys the selected hull.",
+    ));
+
+    lines
+}
+
+fn draw_inspect_overlay(frame: &mut Frame, app: &App, overlay: InspectOverlay) {
+    match overlay {
+        InspectOverlay::MissionBoard => draw_mission_board_overlay(frame, app),
+        InspectOverlay::Station => draw_station_overlay(frame, app),
+        InspectOverlay::Fleet => draw_fleet_overlay(frame, app),
+        InspectOverlay::Shipyard => draw_shipyard_overlay(frame, app),
+        InspectOverlay::Signals => draw_signals_overlay(frame, app),
+    }
+}
+
+fn draw_mission_board_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(84, 82, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Mission Board Detail");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(inner);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(sections[0]);
+    let detail_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(body[1]);
+
+    let contracts = List::new(
+        app.contracts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| contract_list_item(app, index)),
+    )
+    .highlight_style(selection_style())
+    .highlight_symbol(">> ")
+    .block(Block::default().borders(Borders::ALL).title("Contracts"));
+    let mut contract_state = ListState::default();
+    contract_state.select(Some(app.selected_contract));
+    frame.render_stateful_widget(contracts, body[0], &mut contract_state);
+
+    let detail = Paragraph::new(Text::from(contract_detail_lines(app)))
+        .block(Block::default().borders(Borders::ALL).title("Detail"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, detail_sections[0]);
+
+    let shift = Paragraph::new(Text::from(build_mission_text(app)))
+        .block(Block::default().borders(Borders::ALL).title("Shift Status"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(shift, detail_sections[1]);
+
+    let footer = Paragraph::new(Line::from(
+        "Up/Down: choose contract   Enter: accept/release   r: regenerate flavor   i/Esc: close",
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, sections[1]);
+}
+
+fn draw_station_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(86, 84, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Station Detail");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(56),
+            Constraint::Percentage(44),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let route = Paragraph::new(Text::from(route_preview_lines(app)))
+        .block(Block::default().borders(Borders::ALL).title("Route Intel"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(route, sections[0]);
+
+    let detail_lines = station_info_lines(app)
+        .into_iter()
+        .chain(std::iter::once(Line::from("")))
+        .chain(shipyard_lines(app))
+        .collect::<Vec<_>>();
+    let detail = Paragraph::new(Text::from(detail_lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Station & Shipyard"),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, sections[1]);
+
+    let footer_text = if matches!(app.mode, crate::game::AppMode::SelectingDestination { .. }) {
+        "Up/Down: choose destination   Enter: confirm dispatch   z/x/g: map view   i/Esc: close"
+    } else {
+        "Up/Down: choose destination   m: move player   b: buy hull   z/x/g: map view   i/Esc: close"
+    };
+    let footer = Paragraph::new(Line::from(footer_text))
+        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, sections[2]);
+}
+
+fn draw_fleet_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(84, 82, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title("Fleet Detail");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(inner);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(sections[0]);
+
+    let fleet = List::new(app.fleet.iter().enumerate().map(|(index, ship)| {
+        ship_list_item(
+            ship,
+            &app.locations,
+            &app.contracts,
+            app.pending_ship() == Some(index),
+        )
+    }))
+    .highlight_style(selection_style())
+    .highlight_symbol(">> ")
+    .block(Block::default().borders(Borders::ALL).title("Fleet"));
+    let mut fleet_state = ListState::default();
+    fleet_state.select(Some(app.selected_ship));
+    frame.render_stateful_widget(fleet, body[0], &mut fleet_state);
+
+    let detail = Paragraph::new(Text::from(ship_detail_lines(app)))
+        .block(Block::default().borders(Borders::ALL).title("Ship Detail"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, body[1]);
+
+    let footer = Paragraph::new(Line::from(
+        "Up/Down: choose ship   Enter: dispatch   e: exploration   f/t/u: dockside ops   i/Esc: close",
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, sections[1]);
+}
+
+fn draw_shipyard_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(82, 78, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Shipyard Detail");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(inner);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(sections[0]);
+
+    let shipyard = List::new(shipyard_list_items(app))
+        .highlight_style(selection_style())
+        .highlight_symbol("$$ ")
+        .block(Block::default().borders(Borders::ALL).title("Offers"));
+    let mut shipyard_state = ListState::default();
+    let shipyard_count = app.shipyard_offer_count(app.selected_location);
+    shipyard_state.select(if shipyard_count > 0 {
+        Some(app.selected_shipyard_offer.min(shipyard_count - 1))
+    } else {
+        None
+    });
+    frame.render_stateful_widget(shipyard, body[0], &mut shipyard_state);
+
+    let detail = Paragraph::new(Text::from(shipyard_lines(app)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Offer"),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, body[1]);
+
+    let footer = Paragraph::new(Line::from(
+        "Up/Down: choose hull   Enter or b: buy selected hull   i/Esc: close",
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, sections[1]);
+}
+
+fn draw_signals_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(84, 82, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Signals Detail");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(inner);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(sections[0]);
+
+    let alerts_data = app.current_alerts();
+    let alerts = List::new(alerts_data.iter().map(|alert| {
+        let prefix = match alert.severity {
+            crate::game::AlertSeverity::Info => "Info: ",
+            crate::game::AlertSeverity::Warning => "Warn: ",
+            crate::game::AlertSeverity::Critical => "Critical: ",
+        };
+        ListItem::new(format!("{}{}", prefix, alert.summary))
+    }))
+    .highlight_style(selection_style())
+    .highlight_symbol(">> ")
+    .block(Block::default().borders(Borders::ALL).title("Alerts"));
+    let mut alerts_state = ListState::default();
+    alerts_state.select(Some(
+        app.selected_alert.min(alerts_data.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(alerts, body[0], &mut alerts_state);
+
+    let log = List::new(app.log.iter().map(|entry| ListItem::new(entry.as_str())))
+        .block(Block::default().borders(Borders::ALL).title("Event Log"));
+    frame.render_widget(log, body[1]);
+
+    let footer = Paragraph::new(Line::from(
+        "Up/Down: choose alert   Enter: focus selected alert   i/Esc: close",
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, sections[1]);
 }
 
 fn render_sector_map(frame: &mut Frame, area: Rect, app: &App, active: bool) {
