@@ -334,9 +334,9 @@ impl GameData {
         }
 
         let offers = self.shipyard_offers(location_index);
-        let Some(offer_index) =
-            (!offers.is_empty()).then_some(self.selected_shipyard_offer.min(offers.len() - 1))
-        else {
+        let offer_index = if !offers.is_empty() {
+            self.selected_shipyard_offer.min(offers.len() - 1)
+        } else {
             self.set_action_feedback(format!(
                 "The featured hull at {} has already been sold.",
                 self.location_name(location_index)
